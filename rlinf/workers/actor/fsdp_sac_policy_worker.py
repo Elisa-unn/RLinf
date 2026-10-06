@@ -799,10 +799,17 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
 
         # save replay buffer
-        buffer_save_path = os.path.join(
-            save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
-        )
-        self.replay_buffer.save_checkpoint(buffer_save_path)
+        if self.cfg.algorithm.replay_buffer.get("save_with_checkpoint", True):
+            buffer_save_path = os.path.join(
+                save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+            )
+            self.replay_buffer.save_checkpoint(buffer_save_path)
+        else:
+            self.logger.info(
+                "algorithm.replay_buffer.save_with_checkpoint is disabled; "
+                "skipping replay buffer save. This checkpoint holds weights and "
+                "optimizer state only, and cannot restore the original experience."
+            )
 
     def load_checkpoint(self, load_base_path):
         # load model
@@ -844,4 +851,16 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         buffer_load_path = os.path.join(
             load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
         )
-        self.replay_buffer.load_checkpoint(buffer_load_path)
+        if not self.cfg.algorithm.replay_buffer.get("save_with_checkpoint", True):
+            self.logger.info(
+                "algorithm.replay_buffer.save_with_checkpoint is disabled; "
+                "skipping replay buffer load. Training resumes with an empty buffer."
+            )
+        elif not os.path.exists(os.path.join(buffer_load_path, "metadata.json")):
+            self.logger.warning(
+                f"No replay buffer checkpoint found at {buffer_load_path}; resuming "
+                "with an empty buffer. Off-policy training must refill it before it "
+                "can exploit the restored weights."
+            )
+        else:
+            self.replay_buffer.load_checkpoint(buffer_load_path)
