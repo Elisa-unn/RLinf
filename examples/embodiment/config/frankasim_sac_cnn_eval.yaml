@@ -1,0 +1,124 @@
+# Franka-Sim PickCube (vision) — standalone evaluation of a CNN+SAC policy.
+#
+# Results on 2026-09-22 for global_step_8189 of frankasim_sac_cnn_async_fix,
+# 64 episodes each, ~69 s per run with EGL:
+#     run 1: eval/success_once = 0.9219   eval/return = 65.79
+#     run 2: eval/success_once = 0.9844   eval/return = 73.36
+# The spread is env-seed variation (env.eval has no fixed reset state ids), so
+# report this as "92-98% over 2x64 episodes" rather than a single number. For a
+# stable figure, set use_fixed_reset_state_ids: True or average more runs.
+#
+# LAUNCH — do NOT use evaluations/run_eval.sh without overriding MUJOCO_GL.
+#   run_eval.sh defaults to `MUJOCO_GL="${MUJOCO_GL:-osmesa}"` (unlike
+#   run_embodiment.sh / run_async.sh, which default to egl), and osmesa is ~93x
+#   slower for this env. Also, evaluations/ has no frankasim benchmark
+#   directory, so call the entrypoint directly:
+#
+#     cd /path/to/RLinf
+#     EMBODIED_PATH=$PWD/examples/embodiment \
+#     PYTHONPATH=$PWD \
+#     MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+#     CUDA_VISIBLE_DEVICES=0 \
+#     .venv/bin/python evaluations/eval_embodied_agent.py \
+#       --config-path $PWD/examples/embodiment/config \
+#       --config-name frankasim_sac_cnn_eval \
+#       runner.logger.log_path=$PWD/logs/sac_eval
+#
+# HOW THE CHECKPOINT IS LOADED (this is not obvious):
+#   EmbodiedEvalRunner creates only rollout + env — there is no actor worker.
+#   With only_eval: True, MultiStepRolloutWorker sets
+#       self.model_cfg = cfg.rollout.model      (NOT cfg.actor.model)
+#   and then loads runner.ckpt_path into it directly
+#   (rlinf/workers/rollout/hf/huggingface_worker.py, in init_worker). So:
+#     - rollout.model must be a COMPLETE cnn_policy config, hence
+#       `model/cnn_policy@rollout.model` in the defaults list below;
+#     - runner.ckpt_path points at model_state_dict/full_weights.pt.
+#
+#   Note runner.ckpt_path is NOT read by fsdp_sac_policy_worker at all — only
+#   embodied_fsdp_actor_worker (PPO) and the rollout worker honour it. This path
+#   needs no replay buffer, so it still works on checkpoints saved with
+#   algorithm.replay_buffer.save_with_checkpoint: False (unlike
+#   runner.resume_dir, which goes through load_checkpoint).
+
+defaults:
+  - env/frankasim_pickcube_vision@env.eval
+  - model/cnn_policy@rollout.model
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  # No actor worker is created, so only env and rollout are placed. They may
+  # share a device here: the CUDA-IPC weight-sync path that forces the 2-GPU
+  # split during training is not exercised (no actor -> no weight sync).
+  component_placement:
+    env,rollout: 0-0
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "frankasim_sac_cnn_eval"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1
+  max_steps: -1
+
+  only_eval: True          # required: selects cfg.rollout.model in the rollout worker
+  val_check_interval: -1
+  save_interval: -1
+
+  resume_dir: null         # unusable for weights-only SAC checkpoints
+  ckpt_path: /path/to/logs/<run>/<experiment>/checkpoints/global_step_<N>/actor/model_state_dict/full_weights.pt
+
+env:
+  group_name: "EnvGroup"
+
+  eval:
+    obs_format: tensor
+    # 16 envs x 4 epochs x (100 steps / 100-step episode) = 64 clean episodes.
+    # Keep max_steps_per_rollout_epoch == max_episode_steps so each epoch is
+    # exactly one episode per env and no trajectory is truncated mid-way.
+    rollout_epoch: 4
+    total_num_envs: 16
+    auto_reset: True
+    ignore_terminations: False
+    max_episode_steps: 100
+    max_steps_per_rollout_epoch: 100
+    group_size: 1
+    video_cfg:
+      save_video: True
+      info_on_video: True
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: False
+  pipeline_stage_num: 1
+  collect_transitions: False   # no training here, no transitions to collect
+  collect_prev_infos: False
+  enable_torch_compile: False
+  enable_cuda_graph: False
+  # Must match the trained policy exactly, or load_state_dict (strict) fails.
+  # Verified for a valid checkpoint: 206 tensors, 15.4M params, 0 non-finite.
+  model:
+    model_path: "/workspace/RLinf-ResNet10-pretrained"
+    state_dim: 7
+    action_dim: 4
+    num_q_heads: 10
+    image_num: 2
+    precision: "32"
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

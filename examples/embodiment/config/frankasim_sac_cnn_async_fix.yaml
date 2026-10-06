@@ -1,0 +1,208 @@
+# Franka-Sim PickCube (vision) — CNN policy + asynchronous SAC, 2x RTX 5090.
+#
+# Verified 2026-09-22: ~95% success at train time in ~1.5h; independent eval of
+# the resulting checkpoint gave 92.2% and 98.4% over 64 episodes (two runs,
+# differing only by env seed — see frankasim_sac_cnn_eval.yaml).
+#
+# LAUNCH — must use run_async.sh, NOT run_embodiment.sh:
+#     bash examples/embodiment/run_async.sh frankasim_sac_cnn_async_fix
+#
+#   run_async.sh exports MUJOCO_GL=egl and dispatches to train_async.py.
+#   Launching `python train_embodied_agent.py` directly breaks BOTH:
+#     - no MUJOCO_GL  -> MuJoCo falls back to CPU software rendering (osmesa),
+#                        measured 457 ms/env-step vs 4.9 ms with EGL (~93x)
+#     - sync runner   -> training is 0.7% of wall-clock (125s rollout / 0.85s
+#                        train), i.e. 30 hours of wall-clock buys ~12 minutes of
+#                        gradient updates
+#   Together these produced 0% success after 30 hours before the fix. After it:
+#   127.2 s/step -> 0.95 s/step.
+#
+# Derived from the upstream frankasim_sac_cnn_async.yaml. Deviations are marked
+# [HOST] (specific to an unprivileged vast.ai-style container) or [FIX].
+
+defaults:
+  - env/frankasim_pickcube_vision@env.train
+  - env/frankasim_pickcube_vision@env.eval
+  - model/cnn_policy@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  # [HOST] Upstream uses `env,actor,rollout: 0` (all collocated on GPU 0).
+  # That cannot work in an unprivileged container: when actor and rollout share
+  # a device the weight syncer transfers via CUDA IPC, which needs pidfd_getfd ->
+  #     RuntimeError: pidfd_getfd: Operation not permitted
+  # (ptrace_scope=1 and no CAP_SYS_PTRACE). There is no config switch for the
+  # IPC path — see rlinf/scheduler/collective/collective_group.py, the
+  # _check_same_device_with_peer branches. Splitting actor and rollout across
+  # devices routes the sync through NCCL instead.
+  # The rollout worker needs only ~640 MiB, so GPU 1 can be shared with
+  # something else. Measured: actor 1486 MiB, rollout 640 MiB.
+  component_placement:
+    env: 0
+    actor: 0
+    rollout: 1
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"   # run_async.sh overrides this to logs/<timestamp>-<config>
+    project_name: rlinf
+    experiment_name: "frankasim_sac_cnn_async_fix"
+    logger_backends: ["tensorboard"] # wandb, swanlab
+
+  max_epochs: 15000
+  max_steps: -1
+
+  only_eval: False
+  val_check_interval: 210
+
+  # [FIX] Safe only because algorithm.replay_buffer.save_with_checkpoint is
+  # False below. Two constraints:
+  #   - check_progress() asserts save_interval % val_check_interval == 0
+  #   - with save_with_checkpoint: True this MUST stay -1, because
+  #     fsdp_sac_policy_worker.save_checkpoint() then writes the whole replay
+  #     buffer on every save (~196 KB/sample: 24 GB at 127k samples, ~45 GB by
+  #     the end of a 15000-step run) and fills the disk within minutes. That is
+  #     how the pre-fix run died: "/tmp/ray ... is over 95% full" followed by
+  #     "RuntimeError: unexpected pos".
+  # Note -1 means NOTHING is ever saved, not even at max_steps, because
+  # check_progress() gates the train-end save behind `save_interval > 0`.
+  save_interval: 210
+
+  weight_sync_interval: 30
+
+algorithm:
+  update_epoch: 4
+  group_size: 1
+  agg_q: min # or mean
+  actor_agg_q: mean
+  backup_entropy: False
+  critic_subsample_size: 2
+  target_entropy: -2
+  adv_type: embodied_sac
+  loss_type: embodied_sac
+  loss_agg_func: "token-mean"
+  bootstrap_type: standard
+  gamma: 0.96  # Discount factor for future rewards
+  tau: 0.005 # Soft update coefficient for target networks
+
+  entropy_tuning:
+    alpha_type: softplus # choose from ["softplus", "exp", "fixed_alpha"]
+    initial_alpha: 0.01  # Initial temperature value
+    optim:
+      lr: 3.0e-4  # Learning rate for temperature parameter
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+
+  critic_actor_ratio: 4
+  # Replay buffer settings.
+  # cache_size also bounds what save_checkpoint() would write to disk.
+  replay_buffer:
+    enable_cache: True
+    cache_size: 20000 # number of trajectories cached in memory
+    sample_window_size: 20000 # number of latest trajectories to sample from
+    min_buffer_size: 5  # Minimum buffer size before training starts
+    auto_save: False
+    # [FIX] Requires the companion patch to fsdp_sac_policy_worker.py.
+    # Upstream save_checkpoint() always bundles the replay buffer, with no
+    # opt-out; this flag (default True, so other SAC configs are unaffected)
+    # skips it on BOTH the save and load paths. Checkpoints drop from 19-24 GB
+    # to ~213 MB. Set back to True only if you need to resume off-policy
+    # training with the original experience, and check `df -h` first.
+    save_with_checkpoint: False
+
+  target_update_freq: 1  # Frequency of target network updates
+  target_update_type: all # select from ["all", "q_head_only"]
+
+env:
+  group_name: "EnvGroup"
+  # total_num_envs: 1 matches upstream. Raising it does not help much: with EGL
+  # the sim is ~5 ms/step and the bottleneck is the per-step round trip to the
+  # rollout worker.
+  train:
+    obs_format: tensor
+    total_num_envs: 1
+    video_cfg:
+      save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+  eval:
+    rollout_epoch: 5
+    obs_format: tensor
+    total_num_envs: 1
+    video_cfg:
+      save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: False
+  pipeline_stage_num: 1
+  collect_transitions: True
+  collect_prev_infos: False
+  model:
+    model_path: "/workspace/RLinf-ResNet10-pretrained"  # https://huggingface.co/RLinf/RLinf-ResNet10-pretrained
+    state_dim: 7
+    action_dim: 4
+    num_q_heads: 10
+    precision: ${actor.model.precision}
+    image_num: 2
+
+  # [HOST] Upstream sets both to True. Disabled for RTX 5090 (sm_120);
+  # re-enable and re-measure if the toolchain supports it — step time is
+  # 0.95 s/step without them, so the gain would be modest.
+  enable_torch_compile: False
+  enable_cuda_graph: False
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 256     # samples each GPU processes per sampling step
+  global_batch_size: 256    # must be a '_world_size' multiple of micro_batch_size
+  seed: 42
+  enable_offload: False
+  enable_drq: True
+  compile_model: False      # [HOST] see enable_torch_compile above
+  model:
+    model_path: "/workspace/RLinf-ResNet10-pretrained"
+    state_dim: 7
+    action_dim: 4
+    num_q_heads: 10
+    image_num: 2
+
+  optim:
+    clip_grad: 10.0
+    lr: 3e-4
+    lr_scheduler: torch_constant
+
+  critic_optim:
+    clip_grad: 10.0
+    lr: 3e-4
+    lr_scheduler: torch_constant
+
+  # Override the default values in hybrid_engines/fsdp
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

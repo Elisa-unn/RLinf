@@ -1,0 +1,167 @@
+# RECAP Step 4 — CFG training on 2x RTX 5090 (1 epoch).
+#
+# Reference (RLinf docs): 48.8% few-shot SFT baseline -> 66.5% after one RECAP
+# iteration on LIBERO-10 Task 0.
+# Verified run (2026-09-23, 3066 steps, 19h00m, 0 errors):
+#   train/loss 0.0791 -> 0.0171
+#   CFG conditioning behaved exactly as specified for the whole run:
+#     positive_label_ratio          0.299 -> 0.320   (matches q=0.3 from Step 3)
+#     negative_effective_unconditional_ratio  1.0 throughout
+#     negative_conditional_ratio              0.0 throughout (no leakage)
+#     positive_effective_unconditional_ratio  0.098 -> 0.128 (unconditional_prob 0.1)
+#   Evaluated on LIBERO-10 Task 0 (libero_10_task0_cfg_eval.yaml, 50 episodes):
+#     untrained pi05_base control : 0.00
+#     this checkpoint, guidance 1.0: 0.10     1.5: 0.10     2.0: 0.04   3.0: 0.00
+#   So CFG training moved the policy off zero, but well short of 66.5%. Video
+#   inspection showed the failure mode: the policy reaches and grasps
+#   competently but grabs the BASKET instead of the alphabet soup / tomato
+#   sauce named in the instruction — a vision-language grounding failure,
+#   consistent with the frozen PaliGemma below.
+#
+# Usage:
+#   bash examples/offline_rl/policy_optimization/cfg_rl/run_cfg_rl.sh cfg_rl_openpi_2gpu
+#
+# ---------------------------------------------------------------------------
+# MEASURED on this host (2x 31.36 GiB, 3.62B-param pi0.5):
+#
+#   train_expert_only  shard        mbs  peak VRAM  throughput
+#   False (upstream)   full_shard    1   28.8 GiB   0.35 samples/s
+#   True               no_shard     16   20.9 GiB  22.2 samples/s
+#   True               no_shard     32   ~20 GiB   22.8 samples/s   <- this config
+#
+# Upstream uses train_expert_only: False + no_shard, which needs
+#   bf16 weights 7.24G + bf16 grads 7.24G + Adam fp32 m,v 28.96G = 43.4 GiB
+# per GPU before activations — that targets 8x80G, not this box. Two attempted
+# escapes both failed:
+#   - LoRA: not implemented for model_type cfg_model (no lora code anywhere in
+#     rlinf/models/embodiment/openpi_cfg/; the is_lora field in model/pi0_5.yaml
+#     only applies to the plain openpi model type).
+#   - FSDP cpu_offload: RLinf's worker moves the model to GPU, so FSDP raises
+#     "An FSDP-managed module with parameter CPU offloading enabled has
+#     parameters on cuda:0".
+#
+# Freezing the 2B PaliGemma cuts trainable params to ~0.3B, which both fits and
+# removes the full_shard all-gather traffic. Throughput is flat from mbs=16 to
+# mbs=32, so the box is compute-bound; raising the batch further buys nothing.
+#
+# THE TRADE-OFF: the vision-language backbone does not adapt, only the action
+# expert does. pi05_base has never seen LIBERO (control run scored 0.00), so
+# this is exactly the wrong thing to freeze for a new domain — and the eval
+# above confirms it. Note train_expert_only: True is nevertheless the DEFAULT in
+# model/pi0_5.yaml; cfg_rl_openpi.yaml is what overrides it to False.
+# ---------------------------------------------------------------------------
+
+defaults:
+  - model/pi0_5@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/offline_rl/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "cfg_sft_2gpu_ep1"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 30000
+  # 1 epoch = 1,569,879 samples / 512 = 3066 steps ~= 19 h at 22.8 samples/s
+  # (actual: 19h00m). Upstream runs 30000 steps (~10 epochs); runner.resume_dir
+  # can extend this later.
+  max_steps: 3066
+  val_check_interval: -1
+
+  # Each checkpoint is 19 GiB (measured): full_weights.pt 7.2G + 2 DCP shards
+  # holding model + optimizer state. Plan disk BEFORE starting: with 58 GiB free
+  # and saves at 1000/2000/3000 plus the max_steps save, you must prune as you
+  # go. Prune BEFORE the next save (keep 1), not after — keeping 2 requires the
+  # disk to transiently hold 3 (57 GiB), and in the verified run that left only
+  # 208 MB free at the first rotation.
+  save_interval: 1000
+
+data:
+  num_workers: 8
+  # Must match advantage.tag from Step 3.
+  advantage_tag: "fail300_N10_ckpt3000_q30"
+  balance_dataset_weights: true
+  seed: 42
+
+  train_data_paths:
+    # With balance_dataset_weights the resulting sampling weights are
+    # [0.0051, 0.9949] — the 8005-frame sft split is a sparse regulariser, and
+    # 99.5% of the training signal comes from Task-0 rollouts.
+    - dataset_path: /path/to/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_sft
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /path/to/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_train
+      type: "rollout"
+      weight: 1.0
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32
+  global_batch_size: 512      # 2 GPUs x 32 x 8 gradient-accumulation steps
+  seed: 0
+
+  model:
+    precision: null
+    # Converted from the JAX release. See RECAP_NOTES.md: the converter must be
+    # invoked with `python -m`, and LIBERO norm stats must be downloaded
+    # separately into <model_path>/physical-intelligence/libero/.
+    model_path: /path/to/models/pi05_base_pytorch
+    model_type: "cfg_model"
+    add_value_head: False
+    openpi:
+      config_name: "pi05_libero"
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: True   # see the measurement table above
+      guidance_type: "positive"
+      positive_only_conditional: true
+
+  optim:
+    lr: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    # Scaled to this 3066-step run. Leaving the upstream 5000/30000 would keep
+    # the LR in warmup for the entire epoch.
+    lr_warmup_steps: 300
+    total_training_steps: 3066
+    min_lr: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
