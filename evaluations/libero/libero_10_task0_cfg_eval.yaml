@@ -4,12 +4,18 @@
 # iteration. Task 0 is "put both the alphabet soup and the tomato sauce in the
 # basket", 50 init states — the single task the rollout split was collected on.
 #
-# Verified results (2026-09-25, 50 episodes each, ~6.5 min per run):
+# Verified results (50 episodes each, 10-12 min per run):
 #   untrained pi05_base control (ckpt_path=null) : 0.00
-#   cfg_sft_2gpu_ep1 @ cfgrl_guidance_scale 1.0  : 0.10
+#   cfg_sft_2gpu_ep1 @ cfgrl_guidance_scale 1.0  : 0.10   (2026-09-25)
 #                                            1.5 : 0.10
 #                                            2.0 : 0.04
 #                                            3.0 : 0.00
+#   cfg_sft_2gpu_ep2 @ cfgrl_guidance_scale 1.0  : 0.16   (2026-10-08)
+#                                            1.5 : 0.14
+# ep1 vs ep2 at guidance 1.0 is 5/50 vs 8/50: Fisher two-sided p = 0.55, so the
+# two are NOT distinguishable. With use_fixed_reset_state_ids and only 50 Task-0
+# initial states, n=50 is a hard ceiling — re-running varies only the policy's
+# sampling noise, so this error bar cannot be shrunk on this task.
 # Guidance above ~1.5 degrades, which is the expected CFG behaviour when the
 # conditional signal is still weak. Note scale=1.0 is NOT "no guidance": the
 # model computes (1 - s)*v_uncond + s*v_cond, so 1.0 is the pure conditional
@@ -28,14 +34,25 @@
 #       in futex_wait, both env parents sit idle in ep_poll, and all 60 env
 #       subprocesses wait in unix_stream_data_wait. 15 minutes, zero progress,
 #       no error. `env,rollout: 0-0` (single rank) works but 50 LIBERO envs plus
-#       the model on one card OOMs; splitting across cards fits (rollout ~17 GB
+#       the model on one card OOMs; splitting across cards fits (rollout ~20 GB
 #       on GPU0, 50 envs ~32 GB on GPU1).
+#       Check this key in THIS FILE on the machine you launch from: it cannot be
+#       overridden from the CLI (comma in the key), and a machine still carrying
+#       the upstream default will deadlock silently. A healthy run shows DIFFERENT
+#       memory on the two cards and one rank label per group; identical memory and
+#       two ranks per group means both groups landed on both GPUs.
 #
-# LAUNCH — run_eval.sh defaults MUJOCO_GL to osmesa (~93x slower), so override:
+# LAUNCH — run_eval.sh defaults MUJOCO_GL to osmesa (~93x slower) and calls bare
+# `python`, so activate the venv that has libero+openpi and override both:
+#   source <repo>/.venv_recap/bin/activate
 #   ulimit -n 65535
 #   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 #   bash evaluations/run_eval.sh libero libero_10_task0_cfg_eval \
+#       runner.ckpt_path=<...>/actor/model_state_dict/full_weights.pt \
+#       rollout.model.model_path=<...>/pi05_base_pytorch \
 #       rollout.model.openpi.cfgrl_guidance_scale=1.0
+#
+# The two paths below are placeholders and MUST be overridden as shown.
 #
 # Hydra cannot override the placement key from the CLI — `env,rollout` contains
 # a comma and the override grammar rejects it (LexerNoViableAltException). Edit

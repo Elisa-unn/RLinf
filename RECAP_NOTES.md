@@ -105,9 +105,23 @@ switch** for it. This bit three separate times:
 - **SAC async training**: `env,actor,rollout: 0` → crash at weight sync.
   Fix: `env: 0 / actor: 0 / rollout: 1`.
 - **LIBERO eval**: `env,rollout: all` → **silent deadlock**, not a crash.
-  Driver in `futex_wait_queue_me`, env parents idle in `ep_poll`, all 60 env
-  subprocesses in `unix_stream_data_wait`. 15 minutes, zero log output, no
-  error. Fix: one rank each on separate GPUs (`rollout: 0 / env: 1`).
+  Zero log output, no error, GPU utilisation 0%; it recurred later for 27
+  minutes when the config on one machine had drifted back to the upstream
+  default. Fix: one rank each on separate GPUs (`rollout: 0 / env: 1`).
+
+  **`futex_wait_queue_me` on the driver is NOT the signature** — a healthy run
+  shows it continuously too, because the driver waits on worker futexes while
+  the workers do the work. The discriminators that actually hold:
+
+  | | deadlocked | healthy |
+  | --- | --- | --- |
+  | log file size | frozen | growing |
+  | per-GPU memory | **identical** on both cards | differs (e.g. 20179 / 32111 MiB) |
+  | rank labels in log | two per group | one per group |
+
+  Identical memory on both cards is the tell that both groups landed on both
+  GPUs. The env *subprocesses* in `unix_stream_data_wait` and env parents in
+  `ep_poll` are meaningful, but the driver's own wchan is not.
 - Any attempt to attach a debugger (gdb, py-spy) to a running worker also
   fails, for the same ptrace reason — so Python stacks are unavailable and
   hangs must be diagnosed from `/proc/<pid>/wchan` and CPU-time deltas.
@@ -208,7 +222,40 @@ only evidence of liveness that actually held.
 `setsid bash script.sh < /dev/null > log 2>&1 &` survives, because it leaves the
 process group that receives the hangup.
 
-### 1.11 Smaller papercuts
+### 1.11 `run_eval.sh` calls bare `python`
+
+It does not activate a virtualenv, so an unactivated shell gets
+`line 78: python: command not found` and `exit=127` — per guidance value in a
+sweep, which looks like the sweep itself failing. Activate first:
+
+```bash
+source /workspace/RLinf/.venv_recap/bin/activate
+```
+
+Only the RECAP venv has `libero` **and** `openpi`; the plain `.venv` has
+neither (it does have robosuite, mujoco, ray and torch, so a quick
+`find_spec` check is worth doing rather than guessing).
+
+### 1.12 A fixed config in git is not a fixed config on the machine
+
+The eval deadlock of §1.4 recurred after it had been diagnosed and fixed,
+because the fix lived in a local commit while the remote machine still carried
+the upstream `env,rollout: all`. And `component_placement` **cannot** be
+repaired from the command line — the key contains a comma, which Hydra's
+override grammar rejects. A CLI flag cannot save you; the file has to be right.
+
+Check the placement in the file on the machine you are launching on, every
+time:
+
+```bash
+sed -n '/^cluster:/,/^runner:/p' <config>.yaml
+```
+
+Conversely, paths sanitised to `/path/to/...` for the repo must be overridden
+on the CLI (`runner.ckpt_path=`, `rollout.model.model_path=`) — those keys have
+no comma, so they can be.
+
+### 1.13 Smaller papercuts
 
 - **Hydra**: adding a key that isn't in the config needs `+` (e.g.
   `+actor.enable_offload=True`), and keys containing a comma (`env,rollout`)
@@ -349,7 +396,7 @@ perception stack did not, and `pi05_base` had never seen LIBERO (control = 0%).
 
 The first was forced: upstream needs 43.4 GiB/GPU of optimizer state against
 31.36 GiB available, and both escapes (LoRA, cpu_offload) are unavailable —
-see §1.11.
+see §1.13.
 
 **Hardware adaptations (no effect on numbers):** Step 2 `micro_batch_size`
 32→8 (same `global_batch_size` 256, just finer accumulation); Step 3
@@ -427,9 +474,49 @@ it does not affect correctness, loss, or the checkpoint.
 make room, so the 1-epoch policy can no longer be re-evaluated. Its numbers are
 recorded in §3.2 and in the eval config's header comment.
 
-**Still open**: the Task-0 evaluation of `global_step_6132`. 10% → 20%+ means
-epochs were the limiter; 10% → ~12% means the frozen-VLM wall is real and 2x 80GB
-is justified.
+**Result: 10% → 16%, which does not settle the question.**
+
+| policy | guidance | success |
+| --- | --- | --- |
+| untrained `pi05_base` (control) | — | 0.00 |
+| epoch 1 | 1.0 | 0.10 |
+| epoch 1 | 1.5 | 0.10 |
+| **epoch 2** | **1.0** | **0.16** |
+| epoch 2 | 1.5 | 0.14 |
+| published | — | 0.665 |
+
+The pre-registered thresholds were "20%+ → epochs were the limiter" and
+"~12% → the frozen-VLM wall is real". 16% landed between them, and inside the
+noise:
+
+```
+5/50 vs 8/50   Fisher exact, two-sided   p = 0.554
+0.10   95% CI [0.02, 0.18]
+0.16   95% CI [0.06, 0.26]
+```
+
+**The precision cannot be improved by re-running.** `use_fixed_reset_state_ids:
+True` and Task 0 has exactly 50 initial states, so repeats vary only the policy's
+own sampling noise (`noise_level: 0.3`), not the initial-state sample. n=50 is a
+hard ceiling for this task and the binomial error bar comes with it. Designing a
+decision around a 6-point difference at n=50 was a planning mistake — the
+thresholds should have been set from the achievable error bar, not from round
+numbers.
+
+What the run does support, weakly but consistently:
+
+- **Doubling the epochs produced no order-of-magnitude change.** Even taking 16%
+  at face value, 66.5% is 4x away.
+- **The 40-sample mean loss is flat for the entire epoch**, i.e. the trainable
+  parameters have essentially converged.
+- **Guidance > 1 still does not help** (0.14 at 1.5 vs 0.16 at 1.0), the same
+  pattern as epoch 1 (0.10 / 0.10 / 0.04 / 0.00 at 1.0 / 1.5 / 2.0 / 3.0). CFG
+  extrapolation degrading is what a weak conditional branch looks like.
+
+Two weak signals pointing the same way is an inference, not a measurement. The
+frozen vision backbone remains the leading explanation and unfreezing it (2x 80GB)
+is the reasonable next experiment, but this evaluation did not cleanly separate it
+from "not enough epochs".
 
 ## 4. What's in this branch
 
