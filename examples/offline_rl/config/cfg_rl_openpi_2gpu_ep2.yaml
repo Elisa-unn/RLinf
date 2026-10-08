@@ -1,0 +1,139 @@
+# RECAP Step 4 — second epoch, resumed from the 1-epoch run.
+#
+# PURPOSE: decide whether to rent bigger GPUs. The 1-epoch run scored 10% on
+# LIBERO-10 Task 0 (vs an untrained-base control of 0% and a published 66.5%).
+# Three causes were identified, ranked: (1) frozen PaliGemma, (2) 1 epoch vs
+# ~10, (3) value model trained 1/6 as long. This run isolates cause (2):
+#
+#   10% -> 20%+  epochs matter; more epochs on current hardware may suffice
+#   10% -> ~12%  we are against the frozen-VLM wall; renting 2x 80GB is justified
+#
+# 19 hours buys a decision that would otherwise be a guess.
+#
+# Usage:
+#   bash examples/offline_rl/policy_optimization/cfg_rl/run_cfg_rl.sh cfg_rl_openpi_2gpu_ep2
+#
+# ---------------------------------------------------------------------------
+# ⚠️ CHECK train/learning_rate IN THE FIRST FEW STEPS.
+# The first epoch used a cosine schedule with total_training_steps: 3066, so at
+# step 3066 the LR had already decayed to min_lr: 0. Resuming without changing
+# anything would train for 19 hours at LR≈0. Setting total_training_steps: 6132
+# rebuilds the cosine over the full two-epoch span; the restored scheduler state
+# contributes only last_epoch (torch's LambdaLR state_dict excludes the lambda),
+# so step 3066 should land mid-decay at roughly 0.54 * 1e-5 ≈ 5.4e-6.
+# If the log shows learning_rate ≈ 0, kill the run and switch
+# lr_scheduler to "constant" with lr: 5.0e-6 instead.
+#
+# Note this makes the LR trajectory a warm restart rather than one smooth
+# cosine, since epoch 1 ran under a shorter schedule. That is unavoidable when
+# extending a finished cosine run and is acceptable for this experiment.
+# ---------------------------------------------------------------------------
+
+defaults:
+  - model/pi0_5@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/offline_rl/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "cfg_sft_2gpu_ep2"
+    logger_backends: ["tensorboard"]
+
+  # SFTRunner reads global_step back out of the directory name via
+  # parse_global_step_from_checkpoint_path, then loads <resume_dir>/actor.
+  # FSDPCfgWorker inherits load_checkpoint from FSDPModelManager, which restores
+  # model + optimizer + lr_scheduler. No replay-buffer coupling here (that is
+  # SAC-specific), so resume is clean.
+  resume_dir: /workspace/RLinf/logs/cfg_rl/cfg_rl_openpi_2gpu-20260923-04:14:13/cfg_sft_2gpu_ep1/checkpoints/global_step_3066
+
+  max_epochs: 30000
+  max_steps: 6132           # 3066 (already done) + 3066 (one more epoch)
+  val_check_interval: -1
+
+  # Each checkpoint is 19 GiB and only 45 GiB is free at launch. The old
+  # global_step_3066 is deleted once this run is confirmed training, which
+  # brings free space to ~64 GiB; the janitor then keeps only the newest
+  # checkpoint, pruning as soon as a new one lands. Peak concurrent use is
+  # 2 x 19 = 38 GiB.
+  save_interval: 1000
+
+data:
+  num_workers: 8
+  advantage_tag: "fail300_N10_ckpt3000_q30"
+  balance_dataset_weights: true
+  seed: 42
+
+  train_data_paths:
+    - dataset_path: /workspace/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_sft
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /workspace/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_train
+      type: "rollout"
+      weight: 1.0
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32
+  global_batch_size: 512      # 2 GPUs x 32 x 8 gradient-accumulation steps
+  seed: 0
+
+  model:
+    precision: null
+    model_path: /workspace/models/pi05_base_pytorch
+    model_type: "cfg_model"
+    add_value_head: False
+    openpi:
+      config_name: "pi05_libero"
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: True   # unchanged on purpose: this run isolates epochs
+      guidance_type: "positive"
+      positive_only_conditional: true
+
+  optim:
+    lr: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 300        # already passed; kept for schedule shape
+    total_training_steps: 6132  # see the warning block above
+    min_lr: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

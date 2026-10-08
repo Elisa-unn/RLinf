@@ -143,7 +143,72 @@ configs are unaffected. **Both the save and load paths must be guarded** —
 patching only the save side produces checkpoints that crash `resume_dir` on a
 missing buffer.
 
-### 1.7 Smaller papercuts
+### 1.7 A large file write evicts the dataset from the page cache
+
+Writing a 19 GiB checkpoint pushed the training data out of the page cache, and
+the next few hours of steps then went to disk for real: `time/step` rose
+22.6 s → 28.5 s (+26%) with no config change. Freeing the space and letting the
+cache re-warm restored it to 22.7 s. The same failure mode, more acutely, on a
+resume: `rchar` crawling at 1.2 MB/s with CPU at 0% while a raw `dd` of the same
+file did 1.1 GB/s — a cold cache over overlayfs. Fixed there by `cat`-ing the
+11.8 GiB checkpoint to `/dev/null` first (57 s).
+
+On overlayfs the page cache is a load-bearing but invisible dependency. Warm it
+before a resume, and expect a throughput dip after every checkpoint save.
+
+### 1.8 `utilization.gpu` does not measure speed
+
+`utilization.gpu` reports only that *a* kernel was resident — not how fast it
+ran. Both GPUs read 100% throughout a 20% slowdown. The metrics that show
+whether the GPU is actually delivering are `clocks.sm` (against
+`clocks.max.sm`), `power.draw` (against `power.limit`) and
+`clocks_event_reasons.*`:
+
+```
+nvidia-smi --query-gpu=index,power.draw,power.limit,clocks.sm,clocks.max.sm,\
+temperature.gpu,clocks_event_reasons.sw_power_cap,\
+clocks_event_reasons.hw_thermal_slowdown --format=csv
+```
+
+On 2x RTX 5090 this run sat continuously at `sw_power_cap: Active`, 570-580 W
+against a 575 W cap, SM clock 2650-2810 MHz against a 3105 MHz maximum — i.e.
+**~12% below max boost for the entire run**, thermal slowdown never triggered.
+Note this is a *constant* background condition: it does not explain a step
+change in throughput, and attributing one to it was wrong — see §3.6.
+
+### 1.9 `pgrep -f` / `pkill -f` match the command line that invokes them
+
+Checking a background job over SSH with
+
+```bash
+ssh host 'pgrep -fc my_script.sh'      # WRONG — always >= 1
+```
+
+matches the remote shell's own command line, which contains `my_script.sh`. This
+silently reported a dead janitor as alive for three hours, during which a
+checkpoint rotation was missed and the disk fell to 26 GiB. The same pattern with
+`pkill -f` is destructive: it kills the invoking shell too.
+
+Use a bracket so the pattern and the literal text differ, and prefer a liveness
+signal the process itself emits:
+
+```bash
+pgrep -af "[m]y_script.sh"                                  # safe
+age=$(( $(date -u +%s) - $(cat /path/heartbeat) ))           # better
+```
+
+Corollary: verify that a process-name probe matches the *real* process. This
+run's driver is `train_cfg.py`; a probe for `train_cfg_rl` never matched it and
+only ever returned the self-match. Advancing step numbers in the log were the
+only evidence of liveness that actually held.
+
+### 1.10 Detach background jobs with `setsid`, not `nohup`
+
+`nohup bash script.sh &` inside an SSH command died when the session closed.
+`setsid bash script.sh < /dev/null > log 2>&1 &` survives, because it leaves the
+process group that receives the hangup.
+
+### 1.11 Smaller papercuts
 
 - **Hydra**: adding a key that isn't in the config needs `+` (e.g.
   `+actor.enable_offload=True`), and keys containing a comma (`env,rollout`)
@@ -156,7 +221,13 @@ missing buffer.
   once, leaving no file. Write files locally and `scp` them.
 - **Checkpoint rotation must prune BEFORE the next save**, keeping 1. Keeping 2
   means the disk must transiently hold 3; with 19 GiB checkpoints and 58 GiB
-  free that left **208 MB** at the first rotation.
+  free that left **208 MB** at the first rotation. The working version prunes on
+  a 2-minute timer rather than reacting to a save, so peak use is one old
+  checkpoint plus one in flight (38 GiB). It treats a checkpoint as complete only
+  when all four files exist **and** nothing in the directory was modified for
+  3 minutes — DCP writes the two `.distcp` shards before `full_weights.pt`, so
+  file presence alone matches a half-written checkpoint. Sort step numbers with
+  `sort -n` or `global_step_999` outranks `global_step_5000`.
 - **FSDP `cpu_offload` is unusable** with RLinf's workers: they move the model
   to GPU, so FSDP raises *"An FSDP-managed module with parameter CPU offloading
   enabled has parameters on cuda:0"*.
@@ -278,7 +349,7 @@ perception stack did not, and `pi05_base` had never seen LIBERO (control = 0%).
 
 The first was forced: upstream needs 43.4 GiB/GPU of optimizer state against
 31.36 GiB available, and both escapes (LoRA, cpu_offload) are unavailable —
-see §1.7.
+see §1.11.
 
 **Hardware adaptations (no effect on numbers):** Step 2 `micro_batch_size`
 32→8 (same `global_batch_size` 256, just finer accumulation); Step 3
@@ -306,6 +377,60 @@ never advantage-labeled.
 
 ---
 
+### 3.6 Second epoch — isolating "not enough steps"
+
+The 1-epoch run scored 10%. Three causes were ranked (§3.3); this run tests only
+the second, by resuming to 6132 steps and changing nothing else
+(`train_expert_only` stays `True` on purpose). Config:
+`cfg_rl_openpi_2gpu_ep2.yaml`.
+
+**Setting `total_training_steps: 6132` is the whole trick.** Epoch 1 ran a cosine
+schedule declared over 3066 steps, so at step 3066 the LR had already decayed to
+`min_lr: 0`. Resuming without widening the schedule would have trained for 20
+hours at LR≈0. torch's `LambdaLR.state_dict()` excludes the lambda, so the
+restored state contributes only `last_epoch` and the new, wider cosine takes
+effect: the run picked up at 5.4e-6 (≈ 0.54 x 1e-5, as predicted) and decayed to
+7.25e-13 at step 6132. Confirming the LR in the first few steps after a resume is
+the single check worth doing. Note the LR trajectory is a warm restart, not one
+smooth cosine — unavoidable when extending a finished cosine run.
+
+| | value |
+| --- | --- |
+| steps | 3066 → **6132**, completed |
+| wall time | **20 h 39 m** |
+| errors / tracebacks | 0 |
+| `train/loss` (40-sample mean) | 0.0161 at start → **0.0154** at end |
+| final LR | 7.25e-13 |
+| final checkpoint | `global_step_6132`, 19 GiB, verified |
+
+**The loss is flat, and that is the result.** Single-sample readings swing ±0.002
+(0.0136-0.0183), which is wide enough to read any trend into — an early report of
+"steadily decreasing" was just that mistake on three points. Averaged over 40
+samples the value does not move across the whole epoch. Epoch 1 ended at the same
+level, so the flow-matching objective is already near convergence for the
+parameters that are trainable. That *strengthens* the §3.3 diagnosis: the binding
+constraint is the frozen vision backbone, not the step count.
+
+Checkpoint integrity was verified at each save by file inventory plus reading the
+zip central directory of `full_weights.pt`. The central directory is written last,
+at the end of the file, so if it parses (819 tensor entries) the 8.5 GiB write
+completed — a cheap, strong completeness check that does not read the payload.
+
+Throughput oscillated between ~22.6 s/step and ~28 s/step over multi-hour
+stretches. Ruled out: page cache (no save in the window), CPU contention
+(`/proc/pressure/cpu` `some avg300=0.07%`), I/O wait (`wa 0.0`), thermal slowdown
+(not active). The GPU power cap is pinned Active the whole time and therefore
+cannot explain a *switch*; calling it the cause was premature. Left unresolved —
+it does not affect correctness, loss, or the checkpoint.
+
+**Cost of the disk management**: `global_step_3066` from epoch 1 was deleted to
+make room, so the 1-epoch policy can no longer be re-evaluated. Its numbers are
+recorded in §3.2 and in the eval config's header comment.
+
+**Still open**: the Task-0 evaluation of `global_step_6132`. 10% → 20%+ means
+epochs were the limiter; 10% → ~12% means the frozen-VLM wall is real and 2x 80GB
+is justified.
+
 ## 4. What's in this branch
 
 | Path | Purpose |
@@ -313,7 +438,8 @@ never advantage-labeled.
 | `examples/embodiment/config/frankasim_sac_cnn_async_fix.yaml` | SAC training (annotated with all measurements) |
 | `examples/embodiment/config/frankasim_sac_cnn_eval.yaml` | SAC evaluation |
 | `examples/offline_rl/config/recap_compute_advantages_task0.yaml` | RECAP Step 3 |
-| `examples/offline_rl/config/cfg_rl_openpi_2gpu.yaml` | RECAP Step 4 |
+| `examples/offline_rl/config/cfg_rl_openpi_2gpu.yaml` | RECAP Step 4, epoch 1 |
+| `examples/offline_rl/config/cfg_rl_openpi_2gpu_ep2.yaml` | RECAP Step 4, epoch 2 resume (§3.6) |
 | `evaluations/libero/libero_10_task0_cfg_eval.yaml` | LIBERO Task-0 evaluation |
 | `rlinf/workers/actor/fsdp_sac_policy_worker.py` | replay-buffer / checkpoint decoupling (§1.6) |
 
