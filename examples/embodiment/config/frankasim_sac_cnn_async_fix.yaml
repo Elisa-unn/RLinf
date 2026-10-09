@@ -108,6 +108,21 @@ algorithm:
   # Replay buffer settings.
   # cache_size also bounds what save_checkpoint() would write to disk.
   replay_buffer:
+    # [LANDMINE] The flat trajectory cache is allocated in ONE shot on the first
+    # put, as cache_size x traj_slot_len x bytes_per_sample. A frankasim vision
+    # sample is 256*256*3 = 196,608 B, so cache_size: 20000 asks for 393 GB at a
+    # 100-step slot and 1.007 TB at a 256-step one. It survives at
+    # total_num_envs: 1 ONLY because a CPU torch.empty is a virtual reservation
+    # and this host runs overcommit_memory=0, which accepts the 393 GB request
+    # and faults pages in lazily. Raise total_num_envs to 4 and it crosses the
+    # heuristic's threshold:
+    #     RuntimeError: DefaultCPUAllocator: can't allocate memory:
+    #     you tried to allocate 1006632960000 bytes
+    # ...surfacing as the env worker "killed by ray.kill" plus gloo "Connection
+    # closed by peer", with the real exception buried after the cascade.
+    # Size it from the sample instead: 500 x 256 x 192 KiB = 24 GB.
+    # Left at 20000 here because this file records the verified 2026-09-21 run;
+    # lower it before raising total_num_envs. See RECAP_NOTES.md §1.11.
     enable_cache: True
     cache_size: 20000 # number of trajectories cached in memory
     sample_window_size: 20000 # number of latest trajectories to sample from
@@ -126,9 +141,18 @@ algorithm:
 
 env:
   group_name: "EnvGroup"
-  # total_num_envs: 1 matches upstream. Raising it does not help much: with EGL
-  # the sim is ~5 ms/step and the bottleneck is the per-step round trip to the
-  # rollout worker.
+  # total_num_envs: 1 matches upstream. The claim that used to be here — that
+  # raising it "does not help much" because the bottleneck is the per-step round
+  # trip to the rollout worker — was measured, and its conclusion is wrong.
+  # The premise holds: at N=1 only 28% of a cycle is env stepping, the round trip
+  # is the other 72%, and rollout/predict is flat at ~2.3 s for every N. But a
+  # FIXED per-cycle cost is exactly what more envs amortise:
+  #     transitions/s  22.5 -> 95.0   = 4.22x   over N = 1 -> 16
+  #     grad steps/s  1.318 -> 1.075  = 0.82x
+  # N=8 is the knee (3.54x the data for an 8% cost in update rate and +540 MiB),
+  # beyond which the serial Python loop in frankasim_env.step() dominates.
+  # See RECAP_NOTES.md §2.3 and frankasim_sac_envbench_*env.yaml.
+  # Raising this REQUIRES lowering cache_size below — see the note there.
   train:
     obs_format: tensor
     total_num_envs: 1

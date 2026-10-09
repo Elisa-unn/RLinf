@@ -167,8 +167,22 @@ resume: `rchar` crawling at 1.2 MB/s with CPU at 0% while a raw `dd` of the same
 file did 1.1 GB/s — a cold cache over overlayfs. Fixed there by `cat`-ing the
 11.8 GiB checkpoint to `/dev/null` first (57 s).
 
+The worst case was not training but **imports**. `.venv` had not been touched for
+18 days; its 9.9 GB of shared objects were entirely cold, and startup sat in
+`dlopen` / `_imp_create_dynamic` for over 110 s. Warming it first:
+
+```bash
+find "$VENV" -name '*.so*' -type f -print0 | xargs -0 -P 8 cat > /dev/null   # 4m12s
+python -c 'import torch, mujoco, franka_sim, ray'                            # 3.4s  (was >110s)
+```
+
+A **>30x** difference, and in the background it presents only as "no output at
+all" — the process has not crashed and has not hung, it is faulting in pages.
+Running it in the foreground once is what shows where it is stuck.
+
 On overlayfs the page cache is a load-bearing but invisible dependency. Warm it
-before a resume, and expect a throughput dip after every checkpoint save.
+before a resume, warm a venv that has been idle, and expect a throughput dip
+after every checkpoint save.
 
 ### 1.8 `utilization.gpu` does not measure speed
 
@@ -216,27 +230,93 @@ run's driver is `train_cfg.py`; a probe for `train_cfg_rl` never matched it and
 only ever returned the self-match. Advancing step numbers in the log were the
 only evidence of liveness that actually held.
 
+This bit three more times after it was first written down:
+
+- `pkill -f ckpt_janitor.sh` over SSH **killed the invoking shell**, truncating
+  the command mid-way.
+- `pkill -f "<host>.*full_weights"` did the same to a local shell.
+- The same class, without a process: after editing `cache_size: 20000` to `500`,
+  a `re.search(r'cache_size: (\d+)')` self-check reported `20000` — because the
+  **explanatory comment that had just been added** contains the literal text
+  `cache_size: 20000`, and that is the first match in the file. Anchor the pattern
+  to the syntax, not to prose: `grep -E '^ +cache_size:'`.
+
+The general form: a verification pattern that can match the verifier's own text —
+its command line, or a comment it just wrote — proves nothing.
+
 ### 1.10 Detach background jobs with `setsid`, not `nohup`
 
 `nohup bash script.sh &` inside an SSH command died when the session closed.
 `setsid bash script.sh < /dev/null > log 2>&1 &` survives, because it leaves the
 process group that receives the hangup.
 
-### 1.11 `run_eval.sh` calls bare `python`
+### 1.11 The replay buffer allocates `cache_size x traj_len x sample` in one shot
 
-It does not activate a virtualenv, so an unactivated shell gets
-`line 78: python: command not found` and `exit=127` — per guidance value in a
-sweep, which looks like the sweep itself failing. Activate first:
+`FlatTrajectoryCache._ensure_capacity` allocates the whole flat buffer on the
+**first** `put`: `total_samples = max_size * traj_slot_len`, then
+`_alloc_buffer_like` calls `torch.empty` per key. A frankasim vision sample is
+256*256*3 = **196,608 B** (the same 196 KB/sample as §1.6, here in RAM rather than
+on disk), so the committed `cache_size: 20000` means:
 
-```bash
-source /workspace/RLinf/.venv_recap/bin/activate
+| trajectory slot | implied allocation |
+| --- | --- |
+| 100 steps | 393 GB |
+| 256 steps | **1.007 TB** |
+
+```
+RuntimeError: [enforce fail at alloc_cpu.cpp:127] DefaultCPUAllocator:
+can't allocate memory: you tried to allocate 1006632960000 bytes
 ```
 
-Only the RECAP venv has `libero` **and** `openpi`; the plain `.venv` has
-neither (it does have robosuite, mujoco, ray and torch, so a quick
-`find_spec` check is worth doing rather than guessing).
+**This is latent in the known-good config, not hypothetical.** It never fires at
+`total_num_envs: 1` only because a CPU `torch.empty` is a virtual reservation and
+this host runs `overcommit_memory=0` (heuristic): the 393 GB request is accepted
+and pages in lazily, so resident memory stays small. Verified directly on the box
+— `torch.empty(393 GiB)` succeeds, `torch.empty(1007 GiB)` fails with the
+identical message. Raise `total_num_envs` to 4 and the request crosses the
+heuristic's threshold and the run dies ~50 s in.
 
-### 1.12 A fixed config in git is not a fixed config on the machine
+**The failure is heavily disguised.** What the log shows is the env worker
+`killed by ray.kill`, plus gloo `Connection closed by peer` and `ActorDiedError`
+in the actor and rollout. Those are all cascade. The real first exception is in
+`AsyncEmbodiedSACFSDPPolicy.run_training`, buried after the cascade, and the ray
+per-actor logs (`/tmp/ray/session_*/logs/worker-*.err`) are where it can be read
+cleanly. Note the env worker's own log ends normally — it did not fail, it was
+killed.
+
+Fix: size `cache_size` from the sample size. 500 slots x 256 steps x 192 KiB =
+24 GB, which the sweep in §2.3 used at every N.
+
+### 1.12 Neither launcher activates a virtualenv, and the deps are split across two
+
+`run_eval.sh` and `run_async.sh` both call bare `python` and activate nothing, so
+an unactivated shell gets `line 78: python: command not found` and `exit=127` —
+once per point in a sweep, which reads as the sweep harness failing.
+
+Worse, on this machine the dependencies are **split across two venvs** and neither
+is sufficient:
+
+| | `.venv` | `.venv_recap` |
+| --- | --- | --- |
+| `franka_sim` | **yes** | no |
+| `libero`, `openpi` | no | **yes** |
+| `mani_skill` | no | yes |
+| torch, ray, mujoco, robosuite | yes | yes |
+
+So Franka-Sim needs `.venv` and the RECAP/LIBERO work needs `.venv_recap`. Check
+with `find_spec` rather than guessing:
+
+```bash
+"$V/bin/python" -c "import importlib.util as u; print(u.find_spec('franka_sim'))"
+```
+
+Also: `run_async.sh`'s last line has **no trailing newline**, so `cat -n` and
+`wc -l` both stop at line 42 and the script reads as though it writes `$CMD` to a
+log and never runs it. It does run it. The evidence that settles it is the mega
+log the script creates: a run that got as far as importing leaves ~18 KB there,
+one that died at launch leaves only the ~250-byte echoed command.
+
+### 1.13 A fixed config in git is not a fixed config on the machine
 
 The eval deadlock of §1.4 recurred after it had been diagnosed and fixed,
 because the fix lived in a local commit while the remote machine still carried
@@ -255,7 +335,7 @@ Conversely, paths sanitised to `/path/to/...` for the repo must be overridden
 on the CLI (`runner.ckpt_path=`, `rollout.model.model_path=`) — those keys have
 no comma, so they can be.
 
-### 1.13 Smaller papercuts
+### 1.14 Smaller papercuts
 
 - **Hydra**: adding a key that isn't in the config needs `+` (e.g.
   `+actor.enable_offload=True`), and keys containing a comma (`env,rollout`)
@@ -263,6 +343,11 @@ no comma, so they can be.
 - **`run_async.sh` does not forward extra args.** `run_embodiment.sh` has an
   `EXTRA_OVERRIDES` block honouring `STEPS=` / `SAVE_INTER=`; the async script
   does not. Call `train_async.py` directly if you need overrides.
+- **A driver that redirects a child with `>` cannot append to the same file.**
+  The child's file descriptor keeps its own offset, so anything the driver writes
+  with `>>` in the meantime gets overwritten as the child continues. This silently
+  lost the peak-GPU line from every point of the §2.3 sweep; it had to be
+  re-measured into a separate file.
 - **Heredocs over SSH are fragile.** An apostrophe inside the heredoc body
   closes the outer single-quoted remote command; heredocs also failed silently
   once, leaving no file. Write files locally and `scp` them.
@@ -325,6 +410,71 @@ problem — the breakthrough happened after it.
 **Independent evaluation** (`frankasim_sac_cnn_eval.yaml`, 64 episodes, 69 s):
 **92.2%** and **98.4%** on two runs. The spread is env-seed variation, so report
 a range, or set `use_fixed_reset_state_ids: True`.
+
+---
+
+### 2.3 Env-parallelism throughput sweep — `frankasim_sac_envbench_*env.yaml`
+
+Tests the claim that §2.2's config carried: *"total_num_envs: 1 matches upstream.
+Raising it does not help much: with EGL the sim is ~5 ms/step and the bottleneck
+is the per-step round trip to the rollout worker."*
+
+**The premise is right and the conclusion is wrong.** Raising it helps a lot,
+*because* the round trip is a fixed per-cycle cost that more envs amortise.
+
+One collection cycle is `max_steps_per_rollout_epoch` (256) steps **per env**
+(`env_worker.py`: `n_train_chunk_steps = max_steps_per_rollout_epoch //
+num_action_chunks`, applied to the whole vector env), so transitions per cycle are
+`N x 256`. `micro_batch_size` and `global_batch_size` stay at 256, which is what
+isolates the environment side: `actor/update_one_epoch` measured **0.681-0.692 s
+at every N**, dead flat.
+
+900 s wall clock per point, placement unchanged (`env: 0 / actor: 0 /
+rollout: 1`). Measured training span 819-831 s at every point, i.e. the actor
+trains back to back and the comparison is clean.
+
+| N | grad steps | cycles | grad steps/s | **transitions/s** | reuse | cycle s | env step s | ingest s | peak GPU0 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1095 | 73 | 1.318 | **22.5** | 15.0x | 11.30 | 3.18 (28%) | 0.071 | 2961 MiB |
+| 2 | 1076 | 56 | 1.297 | **34.6** | 9.6x | 14.45 | 5.98 (41%) | 0.082 | — |
+| 4 | 1034 | 40 | 1.248 | **49.5** | 6.5x | 19.69 | 10.65 (54%) | 0.115 | — |
+| **8** | 1000 | 32 | **1.215** | **79.6** | 3.9x | 23.99 | 14.17 (59%) | 0.142 | 3502 MiB |
+| 16 | 881 | 19 | 1.075 | **95.0** | 2.9x | 37.28 | 26.21 (70%) | 0.238 | 2883 MiB |
+
+```
+transitions/s   22.5 -> 95.0   = 4.22x
+grad steps/s   1.318 -> 1.075  = 0.82x  (an 18% cost)
+```
+
+Note "grad steps" is the `Global Step` counter, which is **not** the collection
+cycle count: in the async runner the actor keeps training off the buffer while the
+envs collect, so at N=1 there were 1095 gradient steps against only 73 cycles.
+Reading the `env/*` metric boxes as training steps understates the training rate
+by 15x.
+
+**Mechanism.** At N=1 the cycle is 11.30 s of which only 3.18 s (28%) is env
+stepping; the other 8.12 s is the round trip, inference and transfer, and
+`rollout/predict` is flat at ~2.3 s for every N. So the original premise was
+correct. But a fixed per-cycle cost divided over N times more transitions is
+exactly what amortisation means. The gain tapers (1.54x, 1.43x, 1.61x, 1.19x)
+because `frankasim_env.step()` is a **serial Python loop** over independent MuJoCo
+instances (`for i, env in enumerate(self.envs)`, not a batched simulator), so env
+stepping grows from 28% to 70% of the cycle and takes over as the bottleneck.
+
+The 18% cost in gradient steps/s is entirely `actor/run_training` minus
+`actor/update_one_epoch` — the trajectory-ingest overhead, which grows linearly
+(0.071 -> 0.238 s) as the actor digests larger batches.
+
+**Recommendation: `total_num_envs: 8`** — 3.54x the data throughput for an 8% cost
+in update rate and 540 MiB of GPU memory. Memory barely moves with N (under 11% of
+a 32.6 GiB card at every point), so the change is effectively free.
+
+**Limit of this experiment, stated plainly:** it measures *throughput*, not
+time-to-95%. Evaluation and saving were disabled to isolate the timings. Sample
+reuse falls from 15x to 3.9x at N=8, and which data/reuse combination converges
+fastest for off-policy SAC was **not** measured — that needs a run to convergence,
+hours rather than 15 minutes. So N=8 feeds 3.54x more fresh data per second for an
+8% cost in update rate; that it converges faster is very likely but untested.
 
 ---
 
@@ -396,7 +546,7 @@ perception stack did not, and `pi05_base` had never seen LIBERO (control = 0%).
 
 The first was forced: upstream needs 43.4 GiB/GPU of optimizer state against
 31.36 GiB available, and both escapes (LoRA, cpu_offload) are unavailable —
-see §1.13.
+see §1.14.
 
 **Hardware adaptations (no effect on numbers):** Step 2 `micro_batch_size`
 32→8 (same `global_batch_size` 256, just finer accumulation); Step 3
