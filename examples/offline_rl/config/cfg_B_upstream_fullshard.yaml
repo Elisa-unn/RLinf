@@ -1,0 +1,117 @@
+# Candidate B — the true upstream recipe (train_expert_only: False) with
+# full_shard, which splits weights, grads and optimizer state across the two
+# GPUs instead of replicating them.
+#
+# no_shard OOMs at init_worker for this config: 31.36 GiB exhausted with 5.69 MiB
+# free before a single step, so it is the parameter and optimizer state, not
+# activations, and lowering micro_batch_size cannot help.
+#
+# The original table measured full_shard at micro_batch_size 1: 28.8 GiB and
+# 0.35 samples/s. mbs=1 means 512 micro-batches per global step, each paying a
+# per-layer all-gather. At mb=8 that drops to 32 rounds, so throughput should be
+# far better than 0.35 — the untested cell.
+
+defaults:
+  - model/pi0_5@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/offline_rl/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "cfg_B_upstream_fullshard"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 30000
+  # 1 epoch = 1,569,879 samples / 512 = 3066 steps ~= 19.1 h at 22.8 samples/s.
+  # Upstream runs 30000 steps (~10 epochs); resume_dir can extend this later.
+  max_steps: 1
+  val_check_interval: -1
+
+  # Each checkpoint is 19 GiB (measured): full_weights.pt 7.2G + 2 DCP shards.
+  # 59 GiB free -> 3 fit. Saves land at 1000/2000/3000 plus the max_steps save;
+  # older ones get pruned during the run to keep the latest two.
+  save_interval: 1
+
+data:
+  num_workers: 8
+  # Must match advantage.tag from Step 3.
+  advantage_tag: "fail300_N10_ckpt3000_q30"
+  balance_dataset_weights: true
+  seed: 42
+
+  train_data_paths:
+    - dataset_path: /workspace/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_sft
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /workspace/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_train
+      type: "rollout"
+      weight: 1.0
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 8
+  global_batch_size: 512      # 2 GPUs x 32 x 8 gradient-accumulation steps
+  seed: 0
+
+  model:
+    precision: null
+    model_path: /workspace/models/pi05_base_pytorch
+    model_type: "cfg_model"
+    add_value_head: False
+    openpi:
+      config_name: "pi05_libero"
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: False  # upstream value
+      guidance_type: "positive"
+      positive_only_conditional: true
+
+  optim:
+    lr: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    # Warmup and decay are scaled to this 3066-step run. Leaving the upstream
+    # 5000/30000 would keep the LR in warmup for the entire epoch.
+    lr_warmup_steps: 300
+    total_training_steps: 3066
+    min_lr: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

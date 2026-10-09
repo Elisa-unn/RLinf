@@ -519,6 +519,25 @@ Validation checkpoints that passed at each stage:
 The control matters: CFG training moved the policy **from zero**, so the
 pipeline works. But 10% is far from 66.5%.
 
+### 3.2b Transfer to the other nine LIBERO-10 tasks: zero
+
+The policy trained on Task 0 only. The `libero10_task0_sft` split spans all ten
+tasks at 0.5% of the sampling weight (§3.5) and was expected to act as an
+anti-forgetting regulariser. Evaluated at guidance 1.0, 50 episodes each:
+
+| task | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| success_once | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+
+450 trials, and `return` is 0.00 as well — not near-misses, no progress at all.
+
+**Attribution limit:** there is no baseline for the untrained model on tasks 1-9,
+so this does not establish forgetting. Given the untrained control scores 0.00 on
+Task 0, "it never could" is at least as likely as "it learned and forgot". Either
+way it points the same direction as §3.3: what was learned is a Task-0-specific
+action sequence, not an ability to read an instruction and locate the object it
+names.
+
 ### 3.3 Why — diagnosed from video, not guessed
 
 Frame-by-frame comparison at step 450/522 across all 50 envs:
@@ -633,6 +652,8 @@ recorded in §3.2 and in the eval config's header comment.
 | epoch 1 | 1.5 | 0.10 |
 | **epoch 2** | **1.0** | **0.16** |
 | epoch 2 | 1.5 | 0.14 |
+| epoch 2 | 2.0 | 0.12 |
+| epoch 2 | 3.0 | 0.04 |
 | published | — | 0.665 |
 
 The pre-registered thresholds were "20%+ → epochs were the limiter" and
@@ -659,14 +680,107 @@ What the run does support, weakly but consistently:
   at face value, 66.5% is 4x away.
 - **The 40-sample mean loss is flat for the entire epoch**, i.e. the trainable
   parameters have essentially converged.
-- **Guidance > 1 still does not help** (0.14 at 1.5 vs 0.16 at 1.0), the same
-  pattern as epoch 1 (0.10 / 0.10 / 0.04 / 0.00 at 1.0 / 1.5 / 2.0 / 3.0). CFG
-  extrapolation degrading is what a weak conditional branch looks like.
+- **Guidance > 1 still does not help**, and the full curve is now measured at
+  both epochs:
+
+  | guidance | 1.0 | 1.5 | 2.0 | 3.0 |
+  | --- | --- | --- | --- | --- |
+  | epoch 1 | 0.10 | 0.10 | 0.04 | 0.00 |
+  | epoch 2 | 0.16 | 0.14 | 0.12 | 0.04 |
+
+  Epoch 2 is higher at every scale and the shape is identical — best at 1.0,
+  monotonically worse above it. No single point separates from epoch 1 (Fisher
+  p = 0.55 at guidance 1.0), but four independent scales moving the same way is
+  not what pure noise usually looks like. CFG extrapolation degrading above 1.0
+  is what a weak conditional branch looks like, at both epochs.
 
 Two weak signals pointing the same way is an inference, not a measurement. The
 frozen vision backbone remains the leading explanation and unfreezing it (2x 80GB)
 is the reasonable next experiment, but this evaluation did not cleanly separate it
 from "not enough epochs".
+
+### 3.7 Unfreezing the VLM: a full memory and throughput map
+
+§3.4 ranks `train_expert_only: True` as the dominant deviation and calls it
+forced. That is right, but the reason recorded there is incomplete, and the fix
+is not the one the original note implies.
+
+**The 43.4 GiB figure was never measured.** It is arithmetic — `bf16 weights
+7.24G + bf16 grads 7.24G + Adam fp32 m,v 28.96G` for the full 3.62B model under
+`no_shard` — and the only full-unfreeze configuration that *was* measured was
+`full_shard` at `micro_batch_size: 1`: 28.8 GiB, 0.35 samples/s. One cell of the
+grid was tested and one was predicted; the rest was never tried.
+
+Measured here, all of it, with 12 training steps per point:
+
+| config | trainable | shard | mbs | peak GPU | s/step | saves? |
+| --- | --- | --- | --- | --- | --- | --- |
+| frozen (ep1/ep2) | 0.3B | no_shard | 32 | ~20.0 GiB | 22.7 | yes |
+| partial, last 1 of 18 | 0.41B | no_shard | 32 | 30.4 GiB | — | untested |
+| partial, last 2 | 0.52B | no_shard | 16 | 22.1 GiB | — | untested |
+| partial, last 4 | 0.74B | no_shard | 8 | 18.9 GiB | — | untested |
+| partial, last 8 | 1.18B | no_shard | 8 | 21.5 GiB | 26.6 | untested |
+| partial, last 12 | 1.62B | no_shard | 8 | 23.9 GiB | 27.7 | untested |
+| partial, last 18 (all decoder layers) | 2.28B | no_shard | 8 | **27.6 GiB** | 28.7 | **NO** |
+| same, `use_orig_params: False` | 2.28B | no_shard | 8 | — | — | **OOM** |
+| upstream `train_expert_only: False` | 2.7B | no_shard | 8 | — | — | **OOM at init** |
+| upstream `train_expert_only: False` | 2.7B | **full_shard** | **8** | **31.3 GiB** | **208** | **yes, 31.8 GiB** |
+
+Three things fall out.
+
+**1. Activations dominate, so `micro_batch_size` is the knob, not the layer
+count.** Unfreezing *more* layers while lowering `micro_batch_size` lowers peak
+memory: last-1 at mbs=32 costs 30.4 GiB, last-18 at mbs=8 costs 27.6 GiB.
+Gradient accumulation keeps `global_batch_size` at 512 throughout.
+
+**2. Partial unfreezing trains but cannot save.** A mixed `requires_grad` —
+decoder layers trainable, `vision_tower` frozen — makes FSDP's full-state-dict
+hook fail:
+
+```
+AssertionError: FSDP assumes paligemma_with_expert.paligemma.model.vision_tower
+.vision_model.encoder.layers.0.layer_norm1.weight is in the state_dict but the
+state_dict only has odict_keys([...])
+```
+
+Every memory probe above ran with `save_interval: -1`, so "FITS" meant forward,
+backward and optimizer step — **not** saving, which is a separate code path and
+a separate failure. Unfreezing whole layers keeps each FSDP *flat parameter*
+uniform, which is what training needs; it does nothing for state-dict
+collection. `use_orig_params: False` is legal for this shape (no
+*FlatParameter requires uniform requires_grad*) but OOMs during training.
+
+**3. The upstream recipe does run on 2x 32 GiB — and costs 9x the throughput.**
+`train_expert_only: False` + `full_shard` + `mbs=8` fits at 31.3 of 31.36 GiB,
+saves a 31.8 GiB checkpoint, and runs at 208 s/step = 2.46 samples/s against the
+frozen configuration's 22.8. mbs=8 is a 7x throughput improvement over the
+`mbs=1` measurement in the original table (32 all-gather rounds per step instead
+of 512), which confirms the mechanism — and still leaves one epoch at
+**177 hours**.
+
+So the corrected statement of the constraint is not "full unfreezing does not
+fit on 32 GiB cards". It is:
+
+- it fits, with `full_shard` and a small micro-batch;
+- 510 MiB of headroom and a 31.8 GiB checkpoint against 44 GiB of free disk make
+  it fragile — a second checkpoint cannot coexist, so no rotation is possible;
+- at 2.46 samples/s one epoch is 7.4 days, which is why it was not run here.
+
+**This re-justifies renting 80 GB cards, for a different reason than before.**
+Not because unfreezing is impossible, but because 80 GiB admits `no_shard` at a
+useful micro-batch: the same ~43.4 GiB of replicated optimizer state that does
+not fit in 31.36 GiB fits in 80, which removes the per-layer all-gather traffic
+and should return throughput to roughly the frozen figure, i.e. ~20 h/epoch
+rather than 177 h.
+
+The code change supporting the partial-unfreeze rows is
+`openpi.unfreeze_last_n_vlm_layers` in `freeze_vlm()`
+(`openpi_cfg_action_model.py`). It needed no config plumbing: `get_model()`
+copies every key under `actor.model.openpi` onto the model config object. It is
+left in because the memory numbers are useful, but **anything that uses it
+cannot checkpoint** until the state-dict path is fixed.
+
+---
 
 ## 4. What's in this branch
 
@@ -677,6 +791,10 @@ from "not enough epochs".
 | `examples/offline_rl/config/recap_compute_advantages_task0.yaml` | RECAP Step 3 |
 | `examples/offline_rl/config/cfg_rl_openpi_2gpu.yaml` | RECAP Step 4, epoch 1 |
 | `examples/offline_rl/config/cfg_rl_openpi_2gpu_ep2.yaml` | RECAP Step 4, epoch 2 resume (§3.6) |
+| `examples/offline_rl/config/cfg_unfreeze_n*_probe.yaml` | partial-unfreeze memory probes (§3.7) |
+| `examples/offline_rl/config/cfg_A_n18_origFalse.yaml` | partial unfreeze with `use_orig_params: False` — OOMs (§3.7) |
+| `examples/offline_rl/config/cfg_upstream_unfreeze_probe.yaml` | upstream recipe + `no_shard` — OOMs at init (§3.7) |
+| `examples/offline_rl/config/cfg_B_upstream_fullshard.yaml` | upstream recipe + `full_shard` — **runs and saves**, 208 s/step (§3.7) |
 | `evaluations/libero/libero_10_task0_cfg_eval.yaml` | LIBERO Task-0 evaluation |
 | `rlinf/workers/actor/fsdp_sac_policy_worker.py` | replay-buffer / checkpoint decoupling (§1.6) |
 

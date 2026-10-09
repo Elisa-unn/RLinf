@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, TypeVar
@@ -866,10 +867,51 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         return data
 
     def freeze_vlm(self):
-        if self.config.train_expert_only:
-            self.paligemma_with_expert.paligemma.eval()
-            for params in self.paligemma_with_expert.paligemma.parameters():
-                params.requires_grad = False
+        """Freeze the VLM, optionally keeping its last few decoder layers trainable.
+
+        ``openpi.unfreeze_last_n_vlm_layers`` (default 0, i.e. the original
+        all-or-nothing behaviour) keeps the last N Gemma decoder layers of the
+        PaliGemma backbone trainable while everything else in the VLM stays
+        frozen. It exists because a full unfreeze needs 43.4 GiB of optimizer
+        state per GPU against the 31.36 GiB available on a 32 GiB card, and
+        because ``train_expert_only: True`` is the leading suspect for the gap
+        between this reproduction and the published LIBERO numbers: the policy
+        reaches for the basket rather than the named object, which is a
+        vision-language grounding failure rather than a control one.
+
+        Whole layers are unfrozen, never slices of one, so that whichever way the
+        FSDP auto-wrap policy splits the module, a unit is uniformly frozen or
+        uniformly trainable. With ``use_orig_params: False`` a flat parameter
+        spanning both raises *FlatParameter requires uniform requires_grad*, so
+        configs using this want ``use_orig_params: True``.
+        """
+        if not self.config.train_expert_only:
+            return
+
+        paligemma = self.paligemma_with_expert.paligemma
+        paligemma.eval()
+        for params in paligemma.parameters():
+            params.requires_grad = False
+
+        num_unfrozen = int(getattr(self.config, "unfreeze_last_n_vlm_layers", 0) or 0)
+        if num_unfrozen <= 0:
+            return
+
+        layers = paligemma.language_model.layers
+        num_unfrozen = min(num_unfrozen, len(layers))
+        trainable_params = 0
+        for layer in layers[-num_unfrozen:]:
+            layer.train()
+            for params in layer.parameters():
+                params.requires_grad = True
+                trainable_params += params.numel()
+        logging.info(
+            "freeze_vlm: unfroze the last %d of %d VLM decoder layers "
+            "(%.1fM trainable VLM parameters)",
+            num_unfrozen,
+            len(layers),
+            trainable_params / 1e6,
+        )
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""

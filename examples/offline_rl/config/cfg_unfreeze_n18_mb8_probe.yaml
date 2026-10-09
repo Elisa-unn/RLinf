@@ -1,0 +1,137 @@
+# RECAP Step 4 — PARTIAL VLM UNFREEZE probe: last 18 decoder layer(s),
+# micro_batch_size 8.
+#
+# PURPOSE. train_expert_only: True is the leading suspect for 16% vs the
+# published 66.5%: video shows the policy reaching for the basket instead of the
+# named object, a vision-language grounding failure. A full unfreeze needs
+# 43.4 GiB of optimizer state per GPU against 31.36 GiB available, and the ep2
+# run already peaked at 30208 of 32607 MiB, leaving ~2.4 GiB. So the question is
+# how many decoder layers fit, and micro_batch_size is the knob that buys room.
+# Second round: at micro_batch_size 8 the n=4 point peaked at only 19392 MiB of
+# 32607, i.e. ACTIVATIONS dominate rather than optimizer state, so this round
+# pushes n up at a fixed micro_batch_size 8. n=18 is a FULL unfreeze; if that
+# fits, the 43.4 GiB figure was a micro_batch_size 32 artefact and renting
+# 80 GB cards is unnecessary
+# (activations shrink, gradient accumulation keeps global_batch_size at 512).
+#
+# This file is a MEMORY PROBE: max_steps is tiny and nothing is saved. Use it to
+# find the largest N that runs, then do a real one-epoch run at that N.
+#
+# unfreeze_last_n_vlm_layers is read by freeze_vlm() in
+# openpi_cfg_action_model.py. It needs no config plumbing: get_model() copies
+# every key under actor.model.openpi onto the model config object.
+#
+# use_orig_params MUST be True here. With False, an FSDP flat parameter spanning
+# both frozen and trainable weights raises "FlatParameter requires uniform
+# requires_grad". The ep2 run used False because everything in the VLM was
+# frozen; that is no longer true.
+#
+# Started from the base model, NOT resumed from global_step_6132: the optimizer
+# state in that checkpoint was built for a different trainable parameter set.
+# A one-epoch run from base is also the clean A/B against ep1's 10%.
+
+defaults:
+  - model/pi0_5@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/offline_rl/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "cfg_unfreeze_n18_mb8_probe"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 30000
+  # 1 epoch = 1,569,879 samples / 512 = 3066 steps ~= 19.1 h at 22.8 samples/s.
+  # Upstream runs 30000 steps (~10 epochs); resume_dir can extend this later.
+  max_steps: 12
+  val_check_interval: -1
+
+  # Each checkpoint is 19 GiB (measured): full_weights.pt 7.2G + 2 DCP shards.
+  # 59 GiB free -> 3 fit. Saves land at 1000/2000/3000 plus the max_steps save;
+  # older ones get pruned during the run to keep the latest two.
+  save_interval: -1
+
+data:
+  num_workers: 8
+  # Must match advantage.tag from Step 3.
+  advantage_tag: "fail300_N10_ckpt3000_q30"
+  balance_dataset_weights: true
+  seed: 42
+
+  train_data_paths:
+    - dataset_path: /workspace/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_sft
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /workspace/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_train
+      type: "rollout"
+      weight: 1.0
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 8
+  global_batch_size: 512      # 2 GPUs x 32 x 8 gradient-accumulation steps
+  seed: 0
+
+  model:
+    precision: null
+    model_path: /workspace/models/pi05_base_pytorch
+    model_type: "cfg_model"
+    add_value_head: False
+    openpi:
+      config_name: "pi05_libero"
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: True
+      unfreeze_last_n_vlm_layers: 18   # see the measurement table above
+      guidance_type: "positive"
+      positive_only_conditional: true
+
+  optim:
+    lr: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    # Warmup and decay are scaled to this 3066-step run. Leaving the upstream
+    # 5000/30000 would keep the LR in warmup for the entire epoch.
+    lr_warmup_steps: 300
+    total_training_steps: 3066
+    min_lr: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: True
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
