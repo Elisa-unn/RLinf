@@ -5,11 +5,14 @@ each, 61 CPU quota, 503 GB RAM, 200 GB disk)** inside an unprivileged container:
 
 1. **Franka-Sim CNN + asynchronous SAC** — reproduced successfully (92-98%).
 2. **RECAP** (4-stage offline pipeline on LIBERO-10 Task 0) — pipeline runs
-   end to end; result fell short of the published 66.5% for reasons traced to
-   a hardware-forced simplification.
+   end to end. On the 5090s the frozen-VLM simplification that 31.36 GiB forced
+   capped it at 0.10-0.16 against a published 0.665; moving to 2x A100-80GB and
+   removing that one simplification reached **0.56** in the same single epoch
+   (§3.8). **The hardware-forced simplification was the whole gap.**
 
-The machine these ran on was lost. Everything needed to redo the work without
-repeating the debugging is here.
+The 5090 machine and its two A100 successors were all lost in turn (§5 is the
+rebuild order that survived three migrations). Everything needed to redo the
+work without repeating the debugging is here.
 
 ---
 
@@ -363,9 +366,56 @@ no comma, so they can be.
 - **FSDP `cpu_offload` is unusable** with RLinf's workers: they move the model
   to GPU, so FSDP raises *"An FSDP-managed module with parameter CPU offloading
   enabled has parameters on cuda:0"*.
-- **LoRA is not implemented for `model_type: cfg_model`** — there is no lora
-  code in `rlinf/models/embodiment/openpi_cfg/`. The `is_lora` field in
-  `model/pi0_5.yaml` applies only to the plain `openpi` model type.
+- **LoRA is not implemented for `model_type: cfg_model`**, nor for
+  `recap_value_model` (whose config says so outright: `is_lora: false  # Not
+  supported for this model`). So **nothing in the RECAP chain can use LoRA** —
+  the full-unfreeze run below had to be full-parameter.
+  The reason is structural: LoRA has to be injected where the linear layers are
+  constructed, and `openpi_cfg` is a 1051-line wrapper that imports
+  `PI0Pytorch` from the installed `openpi` package rather than owning the
+  layers. The one implementation in this repo is hand-written in
+  `openpi_rlinf/pi0_model/lora.py` (4476-line module that reimplements Gemma):
+  `LoRAConfig(rank, alpha, rslora)`, `scaling_value = alpha/sqrt(rank)` when
+  `rslora` else `alpha/rank`, and `lora_b` zero-initialised so the adapter is a
+  no-op at step 0. Separately, `rlinf/models/__init__.py` wires peft for
+  openvla / openvla-oft. (An earlier version of this note said `is_lora`
+  applied to the plain `openpi` type; it does not — plain `openpi` has no LoRA
+  code either.)
+- **RECAP cannot use `model_type: openpi_rlinf` at all.** `grep -rl
+  "guidance|cfgrl|unconditional" openpi_rlinf/` returns nothing: that module
+  exposes `sft_forward` / `_rlt_forward` / `default_forward` (logprobs for
+  on-policy PPO/GRPO and for RLT), which is a different training objective.
+  CFG routing lives only in `openpi_cfg` (`compute_cfg_routing_masks`). The
+  three pi0.5 entry points are split by RL regime, not duplicated.
+- **`model_type: "pi05"` in `recap_compute_advantages.yaml` is not a
+  `SupportedModel`** — `grep pi05 rlinf/config.py` is empty. It is a field on
+  the value model's own config, mapped to `openpi.models.model.ModelType.PI05`
+  at `rlinf/data/datasets/recap/value_dataset.py:57`. Two same-named things at
+  different layers.
+- **`pyarrow` 26 and `numpy` 1.26 are incompatible, and a fresh install picks
+  pyarrow 26.** It requires numpy >= 2, but gym pins numpy < 2, so every
+  advantages/returns parquet becomes unreadable — the artifacts that cost the
+  most to produce. Pin `pyarrow==17.0.0`.
+- **A global `HF_HUB_ENABLE_HF_TRANSFER=1` poisons `install.sh`.** The fresh
+  venv has no `hf_transfer`, so the hub *refuses every download* rather than
+  falling back: libero assets failed five times and openpi / mani_skill were
+  never installed, with the script still exiting 0. Unset it for the duration
+  of the install, and install only `hf_transfer` — `pip install -U
+  huggingface_hub[hf_transfer]` drags in a hub version that breaks
+  transformers 4.53.
+- **A resumed download trusts half-written files.** The second pi05 conversion
+  failed with `OUT_OF_RANGE` reading an OCDBT shard because the resume skipped
+  a file that was incomplete, not absent. Wipe the cache and verify with
+  `restore_params` *before* converting, never after.
+- **Run directories are named after the config, not `experiment_name`.** A
+  janitor globbing `a100b_upstream_ep1-*` matched nothing for four hours while
+  the real directory was `cfg_a100b_upstream_ep1-*`. Discover with `find ...
+  -path "*$EXP*" -name checkpoints` and **log the directories being watched at
+  startup** — a janitor that prints nothing looks identical to one with nothing
+  to prune.
+- **Toolkit scripts run by path cannot `import rlinf`.** `sys.path[0]` is the
+  script's own directory, so `toolkits/lerobot/calculate_norm_stats.py` fails
+  on import. Pass `PYTHONPATH=<repo>`.
 
 ---
 
@@ -518,6 +568,11 @@ Validation checkpoints that passed at each stage:
 
 The control matters: CFG training moved the policy **from zero**, so the
 pipeline works. But 10% is far from 66.5%.
+
+> **Superseded by §3.8.** Everything in this section was measured with
+> `train_expert_only: True`. Unfreezing the VLM — the only variable changed —
+> takes the same one epoch to **0.56**. Read §3.2–§3.6 as the frozen-VLM arm of
+> an A/B, not as "what RECAP achieves here".
 
 ### 3.2b Transfer to the other nine LIBERO-10 tasks: zero
 
@@ -766,6 +821,10 @@ fit on 32 GiB cards". It is:
   it fragile — a second checkpoint cannot coexist, so no rotation is possible;
 - at 2.46 samples/s one epoch is 7.4 days, which is why it was not run here.
 
+**This was the right call: §3.8 ran it on 80 GiB cards and it is the single
+change that moves 0.10 -> 0.56.** On 32 GiB cards the same result would have
+taken 7.4 days instead of 25 hours.
+
 **This re-justifies renting 80 GB cards, for a different reason than before.**
 Not because unfreezing is impossible, but because 80 GiB admits `no_shard` at a
 useful micro-batch: the same ~43.4 GiB of replicated optimizer state that does
@@ -780,12 +839,87 @@ copies every key under `actor.model.openpi` onto the model config object. It is
 left in because the memory numbers are useful, but **anything that uses it
 cannot checkpoint** until the state-dict path is fixed.
 
+### 3.8 The decisive A/B: unfreezing the VLM — 0.10 to 0.56
+
+Run `cfg_a100b_upstream_ep1` on 2x A100-80GB, 3066 steps (one epoch), finished
+2026-10-11 20:49 UTC. **One variable changed from the §3.2 run:**
+`train_expert_only: False`. lr 1e-5, warmup 300, cosine to 0, micro-batch 32,
+global 512, `no_shard`, `use_orig_params: False`, `total_training_steps: 3066`
+— all held at the ep1 values on purpose.
+
+| policy | g=1.0 | g=1.5 | g=2.0 | g=3.0 |
+| --- | --- | --- | --- | --- |
+| untrained `pi05_base` (control) | 0.00 | | | |
+| frozen VLM, 1 epoch (§3.2) | 0.10 | 0.10 | 0.04 | 0.00 |
+| frozen VLM, 2 epochs (§3.6) | 0.16 | 0.14 | 0.12 | 0.04 |
+| **unfrozen VLM, 1 epoch** | **0.56** | 0.36 | | |
+| published | 0.665 | | | |
+
+5/50 -> 28/50 at the same guidance and the same number of steps. That is 84% of
+the published figure, reached by changing one boolean.
+
+**The frozen PaliGemma was the binding constraint**, and the two epochs of §3.6
+were effort spent on the wrong axis (0.10 -> 0.16 is Fisher p = 0.55, i.e. not
+distinguishable).
+
+**The learning curve says it had already plateaued**, so a second epoch is not
+the next thing to try:
+
+| checkpoint | g=1.0 |
+| --- | --- |
+| 2000 | 0.36 |
+| 2500 | **0.58** |
+| 3066 | 0.56 |
+
+29/50 vs 28/50 between 2500 and 3066 is one episode — noise. Whatever closes the
+remaining 0.56 -> 0.665 gap is not more steps of this configuration; the next
+candidate is §3.4's third deviation, the value model trained 1/6 as long.
+
+**Guidance above 1.0 still degrades** (0.56 -> 0.36 at 1.5), the same direction
+as both frozen runs. Note 1.0 is *not* "guidance off": the model computes
+`(1 - s)*v_uncond + s*v_cond`, so 1.0 is the pure conditional prediction and
+only `s > 1` extrapolates.
+
+#### Training loss did not predict this — and saying so beforehand is what saved the run
+
+| run | first 40 steps | converged |
+| --- | --- | --- |
+| frozen (ep1, ep2) | — | 0.016, flat the whole way |
+| unfrozen | 0.0774 | **0.0129** |
+
+A 19% better loss for a **5.6x** better success rate. An earlier partial-unfreeze
+probe was killed at step 525 precisely because its loss had "flattened at the
+frozen level" — the note written at the time said not to conclude from it,
+because flow-matching loss measures action reconstruction and not
+vision-language grounding. That caveat was correct. **On this pipeline the
+training loss is close to useless as a model-selection signal; only the
+rollout eval is.**
+
+#### Operational notes
+
+- The run survived because `save_interval: 500` plus a janitor keeping the
+  newest 3 (§1.14). The previous machine died at step 530 with
+  `save_interval: 1000`, losing 5 hours.
+- Completion -> checkpoint verification -> janitor kill -> four evals ran
+  unattended from one chained script, because two earlier GPU idles (4.5 h and
+  22 min) were both "a phase finished and waited for a human".
+- Final checkpoint verified by reading the zip central directory, not by file
+  presence: `.metadata` 2,303,958 B, `__0_0.distcp` 13,048,039,511 B,
+  `__1_0.distcp` 12,538,527,191 B, `full_weights.pt` 8,526,557,492 B, 819
+  zip entries.
+- Checkpointing works here only because the unfreeze is *total*. The
+  `unfreeze_last_n_vlm_layers` option of §3.7 leaves mixed `requires_grad`,
+  which breaks FSDP's full-state-dict hook on the frozen `vision_tower`.
+
+---
+
 ---
 
 ## 4. What's in this branch
 
 | Path | Purpose |
 | --- | --- |
+| `examples/offline_rl/config/cfg_a100b_upstream_ep1.yaml` | **The decisive run** (§3.8): upstream recipe with the VLM unfrozen, 0.56 on Task 0 |
 | `examples/embodiment/config/frankasim_sac_cnn_async_fix.yaml` | SAC training (annotated with all measurements) |
 | `examples/embodiment/config/frankasim_sac_cnn_eval.yaml` | SAC evaluation |
 | `examples/offline_rl/config/recap_compute_advantages_task0.yaml` | RECAP Step 3 |
