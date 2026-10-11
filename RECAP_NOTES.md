@@ -593,6 +593,35 @@ way it points the same direction as §3.3: what was learned is a Task-0-specific
 action sequence, not an ability to read an instruction and locate the object it
 names.
 
+**Task 7 sharpens this.** The ten LIBERO-10 instructions, read off the installed
+benchmark (`get_benchmark("libero_10")`, 50 initial states each):
+
+```
+0: put both the alphabet soup and the tomato sauce in the basket   <- trained
+1: put both the cream cheese box and the butter in the basket
+2: turn on the stove and put the moka pot on it
+3: put the black bowl in the bottom drawer of the cabinet and close it
+4: put the white mug on the left plate and put the yellow and white mug on the right plate
+5: pick up the book and place it in the back compartment of the caddy
+6: put the white mug on the plate and put the chocolate pudding to the right of the plate
+7: put both the alphabet soup and the cream cheese box in the basket
+8: put both moka pots on the stove
+9: put the yellow and white mug in the microwave and close it
+```
+
+**Task 7 shares the alphabet soup, the basket, and the "put both ... in the
+basket" sentence form with Task 0** — only the second object differs. It still
+scores 0.00. A policy that had learned *which object the instruction names*
+should get at least the first half of Task 7 right. Scoring zero there is
+consistent with the §3.3 video diagnosis (the frozen policy reaching for the
+basket rather than the named object) and is why the frozen vision backbone was
+promoted to the leading suspect — which §3.8 then confirmed.
+
+Note these nine tasks are also *long-horizon* (LIBERO-10 is LIBERO-LONG: every
+instruction chains two or more pick-and-place stages, and any failed stage fails
+the episode), so zero transfer is less surprising than it would be on a
+single-stage suite. The Task 7 point stands regardless.
+
 ### 3.3 Why — diagnosed from video, not guessed
 
 Frame-by-frame comparison at step 450/522 across all 50 envs:
@@ -721,13 +750,20 @@ noise:
 0.16   95% CI [0.06, 0.26]
 ```
 
-**The precision cannot be improved by re-running.** `use_fixed_reset_state_ids:
-True` and Task 0 has exactly 50 initial states, so repeats vary only the policy's
-own sampling noise (`noise_level: 0.3`), not the initial-state sample. n=50 is a
-hard ceiling for this task and the binomial error bar comes with it. Designing a
-decision around a 6-point difference at n=50 was a planning mistake — the
-thresholds should have been set from the achievable error bar, not from round
-numbers.
+> **Correction (2026-10-11).** The original text here said *"the precision
+> cannot be improved by re-running"*, on the grounds that `use_fixed_reset_state_ids:
+> True` pins the 50 initial states so repeats vary only policy noise. **That
+> conclusion was wrong, and it is wrong for an instructive reason — see §3.9.**
+> Those 50 states are Task 0's *entire* initial-state population, not a sample
+> from it, so there is no initial-state sampling error to be stuck with. The
+> whole remaining uncertainty *is* the policy noise, and policy noise is exactly
+> what repeats average down. The error bar on "this policy's success rate over
+> Task 0's initial-state set" shrinks with every repeat.
+>
+> What stands is the narrower point: **designing a decision around a 6-point
+> difference without first measuring the repeat spread was a planning mistake.**
+> The thresholds should have come from the achievable error bar, not from round
+> numbers. The fix is to measure the spread, which costs ~7 minutes per repeat.
 
 What the run does support, weakly but consistently:
 
@@ -862,8 +898,7 @@ the published figure, reached by changing one boolean.
 were effort spent on the wrong axis (0.10 -> 0.16 is Fisher p = 0.55, i.e. not
 distinguishable).
 
-**The learning curve says it had already plateaued**, so a second epoch is not
-the next thing to try:
+The learning curve:
 
 | checkpoint | g=1.0 |
 | --- | --- |
@@ -871,9 +906,19 @@ the next thing to try:
 | 2500 | **0.58** |
 | 3066 | 0.56 |
 
-29/50 vs 28/50 between 2500 and 3066 is one episode — noise. Whatever closes the
-remaining 0.56 -> 0.665 gap is not more steps of this configuration; the next
-candidate is §3.4's third deviation, the value model trained 1/6 as long.
+29/50 vs 28/50 between 2500 and 3066 is one episode.
+
+> **This does NOT establish a plateau.** An earlier version of this section read
+> it as one ("so a second epoch is not the next thing to try"). That reading
+> ignores the schedule: `cosine` with `total_training_steps: 3066` and
+> `min_lr: 0.0` puts the learning rate at **exactly zero** by step 3066 and
+> already low at 2500, so "saturated" and "the learning rate decayed away"
+> predict the same flat tail. §3.9 lays out the elimination order, and
+> `cfg_a100b_constlr.yaml` is the run that removes this one confound.
+
+Nor is the 0.56 -> 0.665 gap itself established: the Wilson 95% CI on 28/50 is
+[0.423, 0.688], which **contains** 0.665 (two-sided binomial p = 0.13). See §3.9
+before attributing it to anything.
 
 **Guidance above 1.0 still degrades** (0.56 -> 0.36 at 1.5), the same direction
 as both frozen runs. Note 1.0 is *not* "guidance off": the model computes
@@ -913,6 +958,133 @@ rollout eval is.**
 
 ---
 
+### 3.9 What the remaining gap to 0.665 can and cannot be attributed to
+
+§3.8 leaves 0.56 against a published 0.665, and the obvious move is to explain
+it. **That move is premature, and the order in which the candidate explanations
+get eliminated matters more than which one is favoured.**
+
+#### Step 0: the gap has not been established
+
+```
+28/50 = 0.56
+Wilson 95% CI                   [0.423, 0.688]   <- contains 0.665
+two-sided binomial vs p=0.665   p = 0.13
+```
+
+The null hypothesis "this run and the published number do not differ" **is not
+rejected**. Every sentence of the form "the gap is caused by X" is therefore
+explaining a phenomenon that has not been shown to exist. This is the ordinary
+failure mode of seeing two unequal numbers and reaching for a cause.
+
+#### Step 1: shrink the error bar first — it is cheap, and it may dissolve the question
+
+See the correction in §3.6. Task 0's 50 initial states are the whole population,
+the residual uncertainty is policy sampling noise, and that averages down with
+repeats. Mechanism, verified rather than assumed:
+
+- `sample_noise` in the installed openpi is `torch.normal(mean=0., std=1., ...)`
+  with **no `generator`**, so it draws from the global RNG;
+- **nothing in the repo calls `seed_everything`** (`grep -rn seed_everything
+  --include=*.py .` returns only the definition);
+- two fresh processes reported `torch.initial_seed()` of 1.09e19 and 1.64e18,
+  i.e. torch seeds its default generator nondeterministically per process.
+
+So **re-running the identical eval command is an independent draw.** 5 repeats
+is ~37 minutes of GPU time.
+
+> **Do not vary `env.eval.seed` to produce repeats.** The env seed selects the
+> initial-state pool (`reset_state_ids_all[seed_offset]`, `libero_env.py`), so
+> changing it changes *which* states are evaluated and the repeats stop being
+> repeats of the same quantity.
+
+#### Step 2: hyperparameters are already eliminated — by documentation, not by GPU time
+
+§3.4's "matched exactly" list is doing real work here. Step 4's
+`micro_batch_size`, `global_batch_size`, `lr`, `sharding_strategy`,
+`unconditional_prob`, `cfgrl_guidance_scale`, `guidance_type`,
+`positive_only_conditional` and `adv_type` are all upstream values. The only
+unmatched optimiser keys are `lr_warmup_steps` and `total_training_steps`, and
+those **must** scale with `max_steps` or the whole epoch sits in warmup.
+
+**This is the payoff for recording deviations item by item: an entire class of
+explanation gets ruled out without running anything.**
+
+#### Step 3: step count and value-model quality are NOT IDENTIFIABLE here
+
+One observation exists:
+
+```
+(Step 2 = 3000 steps, Step 4 = 3066 steps) -> 0.56
+```
+
+One point cannot apportion an effect between two variables. Separating them
+needs a 2x2:
+
+| | Step 4 = 3066 | Step 4 = 30000 |
+| --- | --- | --- |
+| **Step 2 = 3000** | 0.56 (have) | ? |
+| **Step 2 = 18000** | ? | ? (= upstream) |
+
+~2 weeks of machine time. Until then, any ranking of the two is a prior, not a
+measurement. For the record, the two competing priors are:
+
+- **by magnitude of undertraining, Step 4 is worse**: 1.00 epoch vs upstream's
+  9.78 (9.8x), against the value model's 0.49 vs 2.94 (6.0x) — and if upstream's
+  value model really ran the 8000 steps its config ships rather than the 18000
+  its advantage tag names, only 2.7x;
+- **by irrecoverability, Step 2 is worse**: it determines the sign of the
+  advantage, hence which frames are routed to the conditional branch, hence the
+  training objective itself. Step 4 undertraining means "not far enough along a
+  correct direction" and is fixed by more steps; Step 2 undertraining means the
+  direction is wrong and more Step 4 steps cannot fix it.
+
+Evidence quality also differs, and this is easy to get backwards. The value
+model's "still improving when stopped" is clean — it ran at
+`lr_scheduler: "constant"`, so a rising `cat_acc_best` (0.101 -> 0.191) is not
+confounded. Step 4's apparent plateau is **not** clean, which is §3.9's last
+point. And there is a measured reason to think Step 2 is at least functional
+rather than broken: `value_current` separates expert demos (-0.232) from mixed
+rollouts (-0.517).
+
+#### Step 4: the observed plateau is confounded with the learning-rate schedule
+
+| checkpoint | g=1.0 |
+| --- | --- |
+| 2000 | 0.36 |
+| 2500 | 0.58 |
+| 3066 | 0.56 |
+
+Read as "one epoch saturates this data", this would retire the step-count
+hypothesis. But the run used `lr_scheduler: "cosine"` with
+`total_training_steps: 3066` and `min_lr: 0.0`, so **the learning rate was
+exactly zero at step 3066** and already small at 2500. "Saturated" and "the
+learning rate decayed away" predict the same curve.
+
+`cfg_a100b_constlr.yaml` removes the confound and nothing else:
+`lr_scheduler: "constant"` is warmup-then-flat and ignores
+`total_training_steps` (`get_lr_scheduler`, `rlinf/hybrid_engines/fsdp/utils.py`).
+~25 h.
+
+- still rising at 3066 -> the plateau was the schedule, and step count is live;
+- plateaus again -> one epoch really is saturated, and attention moves to Step 2.
+
+#### The methodological point worth keeping
+
+The strong result in these notes and the weak one differ in **what they are
+compared against**, not in how carefully they were measured:
+
+| claim | comparison | strength |
+| --- | --- | --- |
+| unfreezing the VLM: 0.10 -> 0.56 | **internal** — same machine, data, eval harness, one boolean apart | **strong** |
+| the 0.56 -> 0.665 gap | **external** — a published number whose episode count is not stated (0.488 and 0.665 are not multiples of 1/50, so n != 50), whose seeds and checkpoint are unavailable | **weak** |
+
+A published figure whose measurement protocol cannot be reconstructed is a weak
+comparator no matter how precisely one's own side is measured. **Design the
+experiment so the decisive comparison is internal.**
+
+---
+
 ---
 
 ## 4. What's in this branch
@@ -920,6 +1092,7 @@ rollout eval is.**
 | Path | Purpose |
 | --- | --- |
 | `examples/offline_rl/config/cfg_a100b_upstream_ep1.yaml` | **The decisive run** (§3.8): upstream recipe with the VLM unfrozen, 0.56 on Task 0 |
+| `examples/offline_rl/config/cfg_a100b_constlr.yaml` | Same run with `lr_scheduler: constant` (§3.9): removes the lr-decay confound from the apparent plateau |
 | `examples/embodiment/config/frankasim_sac_cnn_async_fix.yaml` | SAC training (annotated with all measurements) |
 | `examples/embodiment/config/frankasim_sac_cnn_eval.yaml` | SAC evaluation |
 | `examples/offline_rl/config/recap_compute_advantages_task0.yaml` | RECAP Step 3 |

@@ -12,10 +12,23 @@
 #                                            3.0 : 0.00
 #   cfg_sft_2gpu_ep2 @ cfgrl_guidance_scale 1.0  : 0.16   (2026-10-08)
 #                                            1.5 : 0.14
+#   cfg_a100b_upstream_ep1 (VLM UNFROZEN) @ 1.0  : 0.56   (2026-10-11)
+#                                            1.5  : 0.36
+#     same data, same 3066 steps, same lr/batch/schedule as ep1 — the only
+#     change is train_expert_only: False. See RECAP_NOTES.md section 3.8.
+#
 # ep1 vs ep2 at guidance 1.0 is 5/50 vs 8/50: Fisher two-sided p = 0.55, so the
-# two are NOT distinguishable. With use_fixed_reset_state_ids and only 50 Task-0
-# initial states, n=50 is a hard ceiling — re-running varies only the policy's
-# sampling noise, so this error bar cannot be shrunk on this task.
+# two are NOT distinguishable.
+#
+# CORRECTION (2026-10-11): an earlier version of this comment said n=50 was a
+# hard ceiling and "this error bar cannot be shrunk". Wrong. Task 0's 50 initial
+# states are the ENTIRE population, not a sample, so there is no initial-state
+# sampling error; the remaining uncertainty is policy noise, which repeats do
+# average down. openpi's sample_noise calls torch.normal with no generator and
+# nothing in the eval path calls seed_everything (verified: two processes report
+# different torch.initial_seed()), so simply re-running the same command is an
+# independent draw. Do NOT vary env.eval.seed to get repeats — that changes
+# which initial states are used and the repeats stop being repeats.
 # Guidance above ~1.5 degrades, which is the expected CFG behaviour when the
 # conditional signal is still weak. Note scale=1.0 is NOT "no guidance": the
 # model computes (1 - s)*v_uncond + s*v_cond, so 1.0 is the pure conditional
