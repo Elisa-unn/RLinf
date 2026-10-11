@@ -566,8 +566,9 @@ Validation checkpoints that passed at each stage:
 | CFG-trained, guidance 2.0 | 0.04 |
 | CFG-trained, guidance 3.0 | 0.00 |
 
-The control matters: CFG training moved the policy **from zero**, so the
-pipeline works. But 10% is far from 66.5%.
+The control matters only weakly: CFG training moved the policy **from zero**, so
+the pipeline runs end to end. But 10% is far from 66.5%, and see §3.10 — an
+untrained base is not a baseline for RECAP, only a smoke test.
 
 > **Superseded by §3.8.** Everything in this section was measured with
 > `train_expert_only: True`. Unfreezing the VLM — the only variable changed —
@@ -894,6 +895,10 @@ global 512, `no_shard`, `use_orig_params: False`, `total_training_steps: 3066`
 5/50 -> 28/50 at the same guidance and the same number of steps. That is 84% of
 the published figure, reached by changing one boolean.
 
+> **Scope of this result.** It isolates *unfreezing*, and that much is clean. It
+> does **not** show that RECAP's advantage weighting contributed anything,
+> because there is no behaviour-cloning arm to compare against — see §3.10.
+
 **The frozen PaliGemma was the binding constraint**, and the two epochs of §3.6
 were effort spent on the wrong axis (0.10 -> 0.16 is Fisher p = 0.55, i.e. not
 distinguishable).
@@ -1085,6 +1090,70 @@ experiment so the decisive comparison is internal.**
 
 ---
 
+### 3.10 The baseline this project was missing
+
+Raised by the user, and correct: **an untrained `pi05_base` scoring 0.00 is not a
+baseline for RECAP.** It answers "did training do anything at all", which is a
+check one can only fail embarrassingly. The question RECAP exists to answer is
+
+> does advantage-weighted CFG training on mixed success/failure rollouts beat
+> plain imitation learning on *the same data*?
+
+and that needs a behaviour-cloning arm, which this project never ran.
+
+Without it, **0.56 is equally well explained by "train a VLA on 1.56M frames of
+Task-0 data and it gets good at Task 0."** The advantage labels, the 30%
+quantile and the CFG routing would all be unvalidated. §3.8's A/B is still sound
+— it isolates *unfreezing* — but it says nothing about whether RECAP's own
+machinery earned anything.
+
+**Why the published baseline cannot simply be reused:** upstream's 48.8% is a
+*few-shot SFT policy*, and it is the policy that collected these 4096 rollouts
+(hence the dataset name `RECAP-Libero10-Task0-48succ-Data`). Only the dataset is
+published, not that checkpoint, so it cannot be evaluated here. Note also that
+both RECAP runs — upstream's and this one — initialise Step 4 from
+`pi05_base_pytorch` (`cfg_rl_openpi.yaml`, and line 544 of the tutorial), so
+
+- final numbers **are** comparable: 0.56 vs 0.665;
+- the *improvements* are **not** the same quantity: `0.00 -> 0.56` here against a
+  published `48.8% -> 66.5%` that means "the RECAP policy beats the policy that
+  collected its data", not "this model improved by 17.7 points".
+
+#### The control is exact and cheap
+
+The advantage reaches Step 4 as a **boolean column** in the advantage parquet,
+consumed as `advantages_lookup: dict[tuple[int, int], bool]`
+(`rlinf/data/datasets/recap/cfg_model.py`). Rewriting that column to all-`True`
+removes the negative frames, so nothing is routed to the unconditional branch
+beyond the unchanged `unconditional_prob: 0.1` dropout and the conditional
+branch — the one inference uses at guidance 1.0 — trains on every frame
+regardless of advantage. **That is behaviour cloning on the same data, with
+every other knob identical.**
+
+`/workspace/mk_allpos.py` writes it; verified `true_rate 0.3000 -> 1.0000` over
+1,561,874 rows with columns and dtype unchanged. `relabel_advantages.py` cannot
+do this — it enforces `0 < positive_quantile < 1`.
+
+One detail worth noting: the `libero10_task0_sft` split was **already**
+all-positive (`true_rate` 1.0000 before and after), so only the rollout split
+changes — which is the right thing, since that split carries 99.5% of the
+sampling weight (§3.5).
+
+Config: `cfg_a100b_bc_allpos.yaml`, ~25 h.
+
+- **BC ~= 0.56** -> the advantage weighting earned nothing in this setup. A
+  strong negative result, and more informative than 0.56 on its own.
+- **BC much lower** -> the CFG mechanism earned the difference, and only then is
+  "reproduced RECAP" a claim about RECAP rather than about training on Task-0
+  data.
+
+**The general lesson:** a control that cannot fail is not a control. Ours was
+chosen because the right comparator's checkpoint was unavailable, and the
+unavailability should have been recorded as a limitation rather than quietly
+substituted for.
+
+---
+
 ---
 
 ## 4. What's in this branch
@@ -1093,6 +1162,7 @@ experiment so the decisive comparison is internal.**
 | --- | --- |
 | `examples/offline_rl/config/cfg_a100b_upstream_ep1.yaml` | **The decisive run** (§3.8): upstream recipe with the VLM unfrozen, 0.56 on Task 0 |
 | `examples/offline_rl/config/cfg_a100b_constlr.yaml` | Same run with `lr_scheduler: constant` (§3.9): removes the lr-decay confound from the apparent plateau |
+| `examples/offline_rl/config/cfg_a100b_bc_allpos.yaml` | **The missing baseline** (§3.10): same run with every frame labelled positive, i.e. behaviour cloning on the same data |
 | `examples/embodiment/config/frankasim_sac_cnn_async_fix.yaml` | SAC training (annotated with all measurements) |
 | `examples/embodiment/config/frankasim_sac_cnn_eval.yaml` | SAC evaluation |
 | `examples/offline_rl/config/recap_compute_advantages_task0.yaml` | RECAP Step 3 |

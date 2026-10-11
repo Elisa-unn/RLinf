@@ -1,0 +1,153 @@
+# BEHAVIOUR-CLONING CONTROL for the 0.56 result. The missing baseline.
+#
+# The published RECAP comparison is 48.8% (a few-shot SFT policy) -> 66.5%, and
+# that 48.8% policy is the one that COLLECTED these 4096 rollouts (hence the
+# dataset name ...-48succ-Data). Its checkpoint is not published — only the data
+# is — so it cannot be evaluated here. What this project used instead was an
+# untrained pi05_base control scoring 0.00, which answers only "did training do
+# anything", not "did the advantage weighting earn anything".
+#
+# Without this run, 0.56 is equally well explained by "train a VLA on 1.56M
+# frames of Task-0 data and it gets good at Task 0". The advantage labels, the
+# 30% quantile and the CFG routing would all be unvalidated.
+#
+# THE ONE CHANGE: data.advantage_tag points at an advantage parquet whose
+# `advantage` boolean column is all True (written by /workspace/mk_allpos.py;
+# verified 1,561,874 rows, true_rate 0.3000 -> 1.0000, same columns, same dtype).
+# With no negative frames, nothing is routed to the unconditional branch beyond
+# the unchanged unconditional_prob: 0.1 dropout, so the conditional branch —
+# the one inference uses at guidance 1.0 — sees every frame regardless of its
+# advantage. That is behaviour cloning on the same data.
+#
+# relabel_advantages.py cannot produce this: it enforces 0 < positive_quantile < 1.
+#
+# Note the sft split was ALREADY all-positive (true_rate 1.0000 before and
+# after), so only the rollout split actually changes — which is the right thing,
+# since that split carries 99.5% of the sampling weight.
+#
+# Everything else is held at the 0.56 run's values: unfrozen VLM, 3066 steps,
+# lr 1e-5, warmup 300, cosine, mbs 32, global 512, no_shard.
+#
+# READING THE RESULT (50 episodes, Task 0, guidance 1.0; the 0.56 run's repeat
+# spread is being measured separately and is the error bar to compare against):
+#   BC ~= 0.56  -> the advantage weighting earned nothing here. A strong negative
+#                  result, and more useful than the 0.56 number on its own.
+#   BC much lower -> the CFG mechanism earned the difference, and only then is
+#                  "reproduced RECAP" a claim about RECAP rather than about
+#                  training on Task-0 data.
+#
+# ~25 h. Peak 73551 / 81920 MiB (identical shapes to the 0.56 run).
+
+defaults:
+  - model/pi0_5@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/offline_rl/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "a100b_bc_allpos"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 30000
+  # 1 epoch = 1,569,879 samples / 512 = 3066 steps ~= 19 h at 22.8 samples/s
+  # (actual: 19h00m). Upstream runs 30000 steps (~10 epochs); runner.resume_dir
+  # can extend this later.
+  max_steps: 3066
+  val_check_interval: -1
+
+  # Each checkpoint here is 31.8 GiB (measured): full_weights.pt 8.5G plus two
+  # DCP shards of 13.0G + 12.5G holding model + optimizer state. Unfreezing the
+  # VLM is what makes it 31.8 rather than the 19 GiB of the frozen runs, since
+  # the optimizer now carries state for all 3.62B parameters. Plan disk BEFORE
+  # starting and run a janitor: 262 GiB free, keep the newest 3, peak 127 GiB.
+  save_interval: 500
+
+data:
+  num_workers: 8
+  # THE ONE CHANGE from cfg_a100b_upstream_ep1.yaml: all frames labelled positive.
+  advantage_tag: "bcctrl_allpos"
+  balance_dataset_weights: true
+  seed: 42
+
+  train_data_paths:
+    # With balance_dataset_weights the resulting sampling weights are
+    # [0.0051, 0.9949] — the 8005-frame sft split is a sparse regulariser, and
+    # 99.5% of the training signal comes from Task-0 rollouts.
+    - dataset_path: /workspace/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_sft
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /workspace/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_train
+      type: "rollout"
+      weight: 1.0
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32
+  global_batch_size: 512      # 2 GPUs x 32 x 8 gradient-accumulation steps
+  seed: 0
+
+  model:
+    precision: null
+    # Converted from the JAX release. See RECAP_NOTES.md: the converter must be
+    # invoked with `python -m`, and LIBERO norm stats must be downloaded
+    # separately into <model_path>/physical-intelligence/libero/.
+    model_path: /workspace/models/pi05_base_pytorch
+    model_type: "cfg_model"
+    add_value_head: False
+    openpi:
+      config_name: "pi05_libero"
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: False  # upstream: the whole VLM trains
+      guidance_type: "positive"
+      positive_only_conditional: true
+
+  optim:
+    lr: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    # Scaled to this 3066-step run. Leaving the upstream 5000/30000 would keep
+    # the LR in warmup for the entire epoch.
+    lr_warmup_steps: 300
+    total_training_steps: 3066
+    min_lr: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
