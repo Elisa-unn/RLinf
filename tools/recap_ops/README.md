@@ -13,7 +13,11 @@ All paths are the rented-machine layout (`/workspace/RLinf`, `/workspace/dataset
 | `chain3.sh` | Chains eval repeats -> BC control -> prune -> constant-lr run, so the GPUs never wait on a human |
 | `chain4.sh` | **Resumable** successor to `chain3.sh`: refuses to start if training is already running, resumes each phase from its own newest checkpoint, and skips a phase whose result TSV already has rows — so it is safe to launch blindly |
 | `supervise_chain4.sh` + `recap-chain.supervisor.conf` | Makes the box self-healing. Install the conf into `/etc/supervisor/conf.d/`, `supervisorctl reread && supervisorctl update`; `autostart=true` relaunches `chain4.sh` when the container starts |
-| `mk_allpos.py` | Writes the all-positive advantage parquet for the behaviour-cloning control (§3.10) |
+| `mk_allpos.py` | Writes the all-positive advantage parquet for the BC-on-everything control (§3.10) |
+| `mk_succonly.py` | Writes the success-only advantage parquet for the **filtered-BC** arm (§3.12) |
+| `find_successful_episodes.py` | How success was established: grouping the rollout split by episode, `return` at the last frame is exactly `-300.0` (2097) or `0.0` (1999), and 1999/4096 = **48.80%** — the number the tutorial reports as its baseline |
+| `chain5.sh` | Phase C replacement: waits for `chain4.sh`, then the filtered-BC run + eval |
+| `dl_rlt.sh`, `rlt_prep.sh` | RLT (ManiSkill) prep: download, artifact verification, norm stats, env smoke test |
 | `inspect_advantages.py` | Prints row counts, columns and `advantage` true-rate of every advantage parquet |
 | `loss.py` | Windowed means + cumulative differentials of `train/loss`, **alongside `train/learning_rate`** (§3.9) |
 
@@ -37,6 +41,21 @@ All paths are the rented-machine layout (`/workspace/RLinf`, `/workspace/dataset
 - **Verify the artifact, not the exit code.** These read the zip central
   directory of `full_weights.pt`; `$?` after a pipe is the last command's status,
   which once reported success for a dead run.
+- **Never edit a shell script that is mid-execution.** Bash reads a script
+  lazily from the file and keeps a byte offset, so rewriting it corrupts what the
+  running instance reads next. To change a queued phase, use the script's own
+  skip-guard instead — here `constlr_results.tsv` was pre-seeded so `chain4.sh`
+  skipped its constant-lr phase, and `chain5.sh` did the replacement work.
+- **A supervisor and a hand-launched script will both start the same job.** The
+  new wrapper `exec`-ed `chain5.sh` while a hand-launched one was already waiting;
+  both would have cleared the same wait and put two trainings on the same two
+  GPUs. It was caught only because two start banners appeared in one log. The
+  wrapper now refuses if any chain script is already running.
+- **`pgrep` self-matching has a second form.** Bracketing the pgrep pattern
+  (`[c]hain5`) is not enough if a later stage of the same pipeline greps for an
+  unbracketed literal — `pgrep -af "[c]hain5.sh" | grep -c "bash /workspace/chain5.sh"`
+  returned 4 because the invoking command line contains that literal. Count with
+  `ps -eo args --no-headers | awk '$NF=="/path/script.sh"'` instead.
 - **Nothing restarts itself on a rented box.** This instance stopped and came
   back three times, idling 4.5 h, 22 min and 2 h 16 m each time because a human
   had to notice. `ping` succeeding while the SSH port refuses is the signature of

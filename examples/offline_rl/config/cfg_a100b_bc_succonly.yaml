@@ -1,0 +1,156 @@
+# FILTERED BEHAVIOUR CLONING — "throw the failures away and imitate the
+# successes". The classic strong offline-RL baseline, and the one a reviewer
+# asks for: it needs no value model, no advantage and no quantile, so if RECAP
+# cannot beat it, the whole Step 1-3 apparatus bought nothing.
+#
+# Success is unambiguous in this dataset. Grouping the rollout split by episode,
+# `return` at the last frame takes exactly two values:
+#
+#     -300.0   2097 episodes   (failed; the `fail300` tag means failures score -300)
+#        0.0   1999 episodes   (succeeded)
+#
+# and 1999 / 4096 = 48.80%. THAT IS THE 48.8% the RECAP tutorial reports as its
+# "few-shot SFT baseline" — the number is the success rate of this rollout data
+# itself, i.e. of the policy that collected it, not a separate 50-episode eval.
+#
+# Successful episodes are shorter (they stop when they succeed), so 48.80% of
+# episodes is only 35.55% of frames: 555,314 of 1,561,874.
+#
+# THE ONE CHANGE from cfg_a100b_bc_allpos.yaml: advantage_tag. Written by
+# /workspace/mk_succonly.py; verified true_rate 0.3000 -> 0.3555, 1999 episodes,
+# zero episodes with mixed labels, columns and dtype unchanged.
+#
+# The three arms differ in exactly one parquet column, which is what makes the
+# ladder clean:
+#
+#   bcctrl_allpos    every frame positive             -> BC on everything
+#   bcctrl_succonly  every successful frame positive  -> filtered BC   (THIS)
+#   fail300_..._q30  top 30% by advantage positive    -> RECAP (0.512)
+#
+# CAVEAT, recorded on purpose: in CFG training the negative frames still train
+# the UNCONDITIONAL branch, so this is not literally "drop the failures". It is
+# "the conditional branch — the only one inference uses at guidance 1.0 — sees
+# only successful frames", while the failures still touch the shared trunk. A
+# purist filtered BC would drop them from the dataloader; that would change two
+# things at once, so it is not what is done here.
+#
+# STEPS ARE HELD AT 3066, NOT EPOCHS. One epoch over the successful subset would
+# be only 1085 steps, which would confound "filtered data" with "fewer steps".
+# Equal optimisation budget is the fair comparison; this arm therefore sees the
+# successful subset about 2.8 times.
+#
+# ~25 h.
+
+defaults:
+  - model/pi0_5@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/offline_rl/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "a100b_bc_succonly"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 30000
+  # 1 epoch = 1,569,879 samples / 512 = 3066 steps ~= 19 h at 22.8 samples/s
+  # (actual: 19h00m). Upstream runs 30000 steps (~10 epochs); runner.resume_dir
+  # can extend this later.
+  max_steps: 3066
+  val_check_interval: -1
+
+  # Each checkpoint here is 31.8 GiB (measured): full_weights.pt 8.5G plus two
+  # DCP shards of 13.0G + 12.5G holding model + optimizer state. Unfreezing the
+  # VLM is what makes it 31.8 rather than the 19 GiB of the frozen runs, since
+  # the optimizer now carries state for all 3.62B parameters. Plan disk BEFORE
+  # starting and run a janitor: 262 GiB free, keep the newest 3, peak 127 GiB.
+  save_interval: 500
+
+data:
+  num_workers: 8
+  # THE ONE CHANGE from cfg_a100b_bc_allpos.yaml: only successful episodes positive.
+  advantage_tag: "bcctrl_succonly"
+  balance_dataset_weights: true
+  seed: 42
+
+  train_data_paths:
+    # With balance_dataset_weights the resulting sampling weights are
+    # [0.0051, 0.9949] — the 8005-frame sft split is a sparse regulariser, and
+    # 99.5% of the training signal comes from Task-0 rollouts.
+    - dataset_path: /workspace/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_sft
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /workspace/datasets/RECAP-Libero10-Task0-48succ-Data/libero10_task0_train
+      type: "rollout"
+      weight: 1.0
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32
+  global_batch_size: 512      # 2 GPUs x 32 x 8 gradient-accumulation steps
+  seed: 0
+
+  model:
+    precision: null
+    # Converted from the JAX release. See RECAP_NOTES.md: the converter must be
+    # invoked with `python -m`, and LIBERO norm stats must be downloaded
+    # separately into <model_path>/physical-intelligence/libero/.
+    model_path: /workspace/models/pi05_base_pytorch
+    model_type: "cfg_model"
+    add_value_head: False
+    openpi:
+      config_name: "pi05_libero"
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: False  # upstream: the whole VLM trains
+      guidance_type: "positive"
+      positive_only_conditional: true
+
+  optim:
+    lr: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    # Scaled to this 3066-step run. Leaving the upstream 5000/30000 would keep
+    # the LR in warmup for the entire epoch.
+    lr_warmup_steps: 300
+    total_training_steps: 3066
+    min_lr: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
