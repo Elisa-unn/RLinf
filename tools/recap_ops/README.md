@@ -11,6 +11,8 @@ All paths are the rented-machine layout (`/workspace/RLinf`, `/workspace/dataset
 | --- | --- |
 | `janitor5.sh` | Prunes checkpoints to the newest N. `janitor5.sh <exp-substring> [keep]` |
 | `chain3.sh` | Chains eval repeats -> BC control -> prune -> constant-lr run, so the GPUs never wait on a human |
+| `chain4.sh` | **Resumable** successor to `chain3.sh`: refuses to start if training is already running, resumes each phase from its own newest checkpoint, and skips a phase whose result TSV already has rows — so it is safe to launch blindly |
+| `supervise_chain4.sh` + `recap-chain.supervisor.conf` | Makes the box self-healing. Install the conf into `/etc/supervisor/conf.d/`, `supervisorctl reread && supervisorctl update`; `autostart=true` relaunches `chain4.sh` when the container starts |
 | `mk_allpos.py` | Writes the all-positive advantage parquet for the behaviour-cloning control (§3.10) |
 | `inspect_advantages.py` | Prints row counts, columns and `advantage` true-rate of every advantage parquet |
 | `loss.py` | Windowed means + cumulative differentials of `train/loss`, **alongside `train/learning_rate`** (§3.9) |
@@ -35,6 +37,12 @@ All paths are the rented-machine layout (`/workspace/RLinf`, `/workspace/dataset
 - **Verify the artifact, not the exit code.** These read the zip central
   directory of `full_weights.pt`; `$?` after a pipe is the last command's status,
   which once reported success for a dead run.
+- **Nothing restarts itself on a rented box.** This instance stopped and came
+  back three times, idling 4.5 h, 22 min and 2 h 16 m each time because a human
+  had to notice. `ping` succeeding while the SSH port refuses is the signature of
+  a stopped container: the host's port mapping is still there with nothing behind
+  it. The fix is a supervisor program with `autostart=true` plus a chain script
+  that is safe to launch blindly — not a human checking.
 - **Read loss next to the learning rate.** A cosine schedule with
   `total_training_steps == max_steps` and `min_lr: 0` puts the LR at ~3e-12 by the
   final step, so the loss flattens whether or not the data is exhausted.
