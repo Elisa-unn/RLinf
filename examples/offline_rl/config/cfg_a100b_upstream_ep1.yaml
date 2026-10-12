@@ -18,24 +18,37 @@
 #
 # RESULT (50 episodes, LIBERO-10 Task 0, finished 2026-10-11 20:49 UTC):
 #
-#   policy                            g=1.0   g=1.5
-#   untrained pi05_base control        0.00
-#   frozen VLM, 1 epoch                0.10    0.10
-#   frozen VLM, 2 epochs               0.16    0.14
-#   THIS RUN, unfrozen, 1 epoch        0.56    0.36
-#   published                          0.665
+#   policy                            g=1.0   g=1.5    n
+#   untrained pi05_base control        0.00             50
+#   frozen VLM, 1 epoch                0.10    0.10     50
+#   frozen VLM, 2 epochs               0.16    0.14     50
+#   THIS RUN, unfrozen, 1 epoch        0.512   0.36     250 / 50
+#   published                          0.665            not stated
 #
-# 5/50 -> 28/50 by changing one boolean. The frozen PaliGemma was the binding
-# constraint; the extra epoch of the ep2 run was the wrong axis (0.10 vs 0.16 is
-# Fisher p = 0.55).
+# 5/50 -> 128/250 by changing one boolean, Fisher two-sided p = 1.75e-08. The
+# frozen PaliGemma was the binding constraint; the extra epoch of the ep2 run was
+# the wrong axis (0.10 vs 0.16 is Fisher p = 0.55).
 #
-# Intermediate checkpoints at g=1.0: step 2000 -> 0.36, 2500 -> 0.58,
-# 3066 -> 0.56. Already plateaued, so more steps of THIS config is not the next
-# move; the remaining 0.56 -> 0.665 gap points at the value model, which was
-# trained 1/6 as long as upstream's.
+# THE HEADLINE IS 0.512, NOT 0.56. The first n=50 run gave 0.56 and that turned
+# out to be the MAXIMUM of five repeats: 0.56 0.48 0.56 0.48 0.48, pooled
+# 128/250 = 0.512, cluster-aware 95% CI [0.458, 0.566]. Per-run spread is 8
+# points, so a single n=50 eval is not quotable. Repeat five times first.
+#
+# The gap to 0.665 IS real at n=250 (p = 6e-07) though it was NOT established at
+# n=50 (p = 0.13). See RECAP_NOTES.md sections 3.9 and 3.11.
+#
+# Intermediate checkpoints at g=1.0 (single runs, so +/- 8 points): step
+# 2000 -> 0.36, 2500 -> 0.58, 3066 -> 0.56. 2500 vs 3066 is noise. Do NOT read
+# this as a plateau: lr_scheduler is cosine with total_training_steps == 3066 and
+# min_lr 0, so the learning rate was 3.2e-12 by the last step and the model was
+# effectively frozen. cfg_a100b_constlr.yaml removes that confound.
 #
 # Training loss does not predict any of this: 0.0129 converged here vs 0.016
-# frozen, a 19% improvement for a 5.6x success rate. Select on rollout eval only.
+# frozen, a 19% improvement for a 5x success rate. Select on rollout eval only.
+#
+# NOTE this run has no behaviour-cloning baseline. See cfg_a100b_bc_allpos.yaml:
+# without it, 0.512 is equally well explained by "train a VLA on 1.56M frames of
+# Task-0 data and it gets good at Task 0".
 
 defaults:
   - model/pi0_5@actor.model

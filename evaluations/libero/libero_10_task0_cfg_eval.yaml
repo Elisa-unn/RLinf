@@ -12,10 +12,14 @@
 #                                            3.0 : 0.00
 #   cfg_sft_2gpu_ep2 @ cfgrl_guidance_scale 1.0  : 0.16   (2026-10-08)
 #                                            1.5 : 0.14
-#   cfg_a100b_upstream_ep1 (VLM UNFROZEN) @ 1.0  : 0.56   (2026-10-11)
-#                                            1.5  : 0.36
+#   cfg_a100b_upstream_ep1 (VLM UNFROZEN) @ 1.0  : 0.512  (2026-10-11, n=250)
+#                                            1.5  : 0.36   (n=50)
 #     same data, same 3066 steps, same lr/batch/schedule as ep1 — the only
 #     change is train_expert_only: False. See RECAP_NOTES.md section 3.8.
+#     The 0.512 is five repeats of the SAME command on the SAME checkpoint:
+#     0.56 0.48 0.56 0.48 0.48 -> 128/250, cluster-aware 95% CI [0.458, 0.566].
+#     A SINGLE n=50 RUN IS NOT QUOTABLE: the spread is 8 points and the first
+#     run (0.56) was the maximum of the five.
 #
 # ep1 vs ep2 at guidance 1.0 is 5/50 vs 8/50: Fisher two-sided p = 0.55, so the
 # two are NOT distinguishable.

@@ -416,6 +416,16 @@ no comma, so they can be.
 - **Toolkit scripts run by path cannot `import rlinf`.** `sys.path[0]` is the
   script's own directory, so `toolkits/lerobot/calculate_norm_stats.py` fails
   on import. Pass `PYTHONPATH=<repo>`.
+- **`set -u` before the log redirect makes a dead script invisible.** A chained
+  runner had `set -u`, the venv activation and `export PYTHONPATH=...:$PYTHONPATH`
+  *above* its `exec >> "$LOG" 2>&1`. `PYTHONPATH` was unset, `set -u` killed the
+  script instantly, and it left **no log at all** — indistinguishable from never
+  having been launched. Redirect first, then `set -u`; and use
+  `${VAR:-}` for anything that may be unset.
+- **A results TSV written by two scripts drifts a column.** The second script
+  wrote 5 fields under the first one's 6-field header, so `rc` landed in the
+  `return` column and `rc` read empty — which looks like a failed run. Re-derive
+  from the per-run logs before believing a tabulated zero.
 
 ---
 
@@ -884,16 +894,22 @@ Run `cfg_a100b_upstream_ep1` on 2x A100-80GB, 3066 steps (one epoch), finished
 global 512, `no_shard`, `use_orig_params: False`, `total_training_steps: 3066`
 — all held at the ep1 values on purpose.
 
-| policy | g=1.0 | g=1.5 | g=2.0 | g=3.0 |
-| --- | --- | --- | --- | --- |
-| untrained `pi05_base` (control) | 0.00 | | | |
-| frozen VLM, 1 epoch (§3.2) | 0.10 | 0.10 | 0.04 | 0.00 |
-| frozen VLM, 2 epochs (§3.6) | 0.16 | 0.14 | 0.12 | 0.04 |
-| **unfrozen VLM, 1 epoch** | **0.56** | 0.36 | | |
-| published | 0.665 | | | |
+| policy | g=1.0 | g=1.5 | g=2.0 | g=3.0 | n |
+| --- | --- | --- | --- | --- | --- |
+| untrained `pi05_base` (control) | 0.00 | | | | 50 |
+| frozen VLM, 1 epoch (§3.2) | 0.10 | 0.10 | 0.04 | 0.00 | 50 |
+| frozen VLM, 2 epochs (§3.6) | 0.16 | 0.14 | 0.12 | 0.04 | 50 |
+| **unfrozen VLM, 1 epoch** | **0.512** | 0.36 | | | **250** |
+| published | 0.665 | | | | not stated |
 
-5/50 -> 28/50 at the same guidance and the same number of steps. That is 84% of
-the published figure, reached by changing one boolean.
+> **The headline number is 0.512, not the 0.56 first reported.** That 0.56 came
+> from a single n=50 run and turned out to be the **maximum** of five repeats
+> (§3.11). Pooled over 5 x 50 = 250 trials the estimate is 0.512 with
+> 95% CI [0.458, 0.566].
+
+5/50 -> 128/250 at the same guidance and the same number of steps, **Fisher
+two-sided p = 1.75e-08**. Changing one boolean accounts for roughly a 5x change
+in success rate.
 
 > **Scope of this result.** It isolates *unfreezing*, and that much is clean. It
 > does **not** show that RECAP's advantage weighting contributed anything,
@@ -921,9 +937,11 @@ The learning curve:
 > predict the same flat tail. §3.9 lays out the elimination order, and
 > `cfg_a100b_constlr.yaml` is the run that removes this one confound.
 
-Nor is the 0.56 -> 0.665 gap itself established: the Wilson 95% CI on 28/50 is
-[0.423, 0.688], which **contains** 0.665 (two-sided binomial p = 0.13). See §3.9
-before attributing it to anything.
+The gap to the published figure **is** established, but only after repeating the
+eval: at n=50 the Wilson CI on 28/50 was [0.423, 0.688] and *contained* 0.665
+(p = 0.13), so for a while these notes said the two were indistinguishable. At
+n=250 the estimate is 0.512, CI [0.458, 0.566], p = 6e-07 — a real 15-point gap.
+See §3.11.
 
 **Guidance above 1.0 still degrades** (0.56 -> 0.36 at 1.5), the same direction
 as both frozen runs. Note 1.0 is *not* "guidance off": the model computes
@@ -969,7 +987,9 @@ rollout eval is.**
 it. **That move is premature, and the order in which the candidate explanations
 get eliminated matters more than which one is favoured.**
 
-#### Step 0: the gap has not been established
+#### Step 0: establish the gap first — this one was initially NOT established, then was
+
+At the time this section was written, one n=50 run existed:
 
 ```
 28/50 = 0.56
@@ -977,10 +997,18 @@ Wilson 95% CI                   [0.423, 0.688]   <- contains 0.665
 two-sided binomial vs p=0.665   p = 0.13
 ```
 
-The null hypothesis "this run and the published number do not differ" **is not
-rejected**. Every sentence of the form "the gap is caused by X" is therefore
-explaining a phenomenon that has not been shown to exist. This is the ordinary
+The null hypothesis was **not** rejected, so every sentence of the form "the gap
+is caused by X" was explaining a phenomenon not yet shown to exist — the ordinary
 failure mode of seeing two unequal numbers and reaching for a cause.
+
+> **Resolved by Step 1 below, in 40 minutes of GPU time.** Five repeats give
+> 128/250 = 0.512, CI [0.458, 0.566], p = 6e-07. **The gap is real and is about
+> 15 points**, so the attribution question that the rest of this section sets up
+> is now a legitimate one. See §3.11.
+>
+> Keeping the original wording here on purpose: the sequence *refuse to
+> attribute -> find the mechanism that shrinks the error bar -> measure ->
+> attribute* is the point, not the conclusion at either end.
 
 #### Step 1: shrink the error bar first — it is cheap, and it may dissolve the question
 
@@ -1151,6 +1179,80 @@ Config: `cfg_a100b_bc_allpos.yaml`, ~25 h.
 chosen because the right comparator's checkpoint was unavailable, and the
 unavailability should have been recorded as a limitation rather than quietly
 substituted for.
+
+---
+
+### 3.11 Repeating the eval: the single-run number was 5 points optimistic
+
+The experiment §3.9 called for first. Five runs of the **identical** eval command
+on the **same** checkpoint (`global_step_3066`, guidance 1.0):
+
+| run | successes / 50 | rate |
+| --- | --- | --- |
+| 1 | 28 | 0.56 |
+| 2 | 24 | 0.48 |
+| 3 | 28 | 0.56 |
+| 4 | 24 | 0.48 |
+| 5 | 24 | 0.48 |
+
+Two estimators, because the 250 trials are **not** independent — the five runs
+share the same 50 initial states, so they are clustered by init state:
+
+```
+A) repeat-level (cluster-aware, assumption-light)   <- the honest one
+     mean 0.5120   sd 0.0438   SE 0.0196
+     95% CI (t, df=4)  [0.4576, 0.5664]
+     0.665 sits 7.8 SE above the mean
+
+B) naive pooled binomial (treats the 250 as independent)
+     128/250 = 0.5120   Wilson 95% CI [0.4503, 0.5733]
+     two-sided binomial vs 0.665:  p = 5.96e-07
+```
+
+Both exclude 0.665, so the conclusion does not depend on which is used. (B) is
+reported only to show that; (A) is what to quote.
+
+#### Three conclusions
+
+1. **The headline is 0.512, not 0.56.** The first run was the maximum of five.
+   A single n=50 measurement overstated the result by ~5 points. *Repeat before
+   quoting a number.*
+2. **The gap to the published 0.665 is real: ~15 points, p = 6e-07.** The
+   earlier "statistically indistinguishable" reading was an artifact of n=50.
+3. **The unfreezing result got stronger, not weaker.** 5/50 vs 128/250 is Fisher
+   two-sided **p = 1.75e-08**, up from a borderline single-run comparison.
+
+#### Why repeating works here, and the correction it confirms
+
+§3.6 originally said this error bar could not be shrunk, because
+`use_fixed_reset_state_ids: True` pins the initial states. The reasoning was
+backwards: those 50 states are Task 0's **entire** population, so there is no
+init-state sampling error to be stuck with, and the whole residual uncertainty is
+policy sampling noise — exactly what repeats average down. Verified mechanism:
+
+- `sample_noise` in the installed openpi is `torch.normal(mean=0., std=1., ...)`
+  with **no `generator`**, so it draws from the global RNG;
+- `grep -rn seed_everything --include=*.py .` returns **only the definition** —
+  nothing in the eval path seeds torch;
+- two fresh processes reported `torch.initial_seed()` of 1.09e19 and 1.64e18.
+
+So re-running the identical command is an independent draw, at ~7.3 min each.
+
+> **Do not vary `env.eval.seed` for repeats.** It selects the initial-state pool
+> (`reset_state_ids_all[seed_offset]`, `libero_env.py`), so changing it changes
+> *which* states are evaluated and the runs stop being repeats of one quantity.
+
+#### Consequence for every other number in these notes
+
+The per-run spread is **8 points** (0.48 to 0.56). Every other success rate here
+is a single n=50 run and carries a comparable error bar. In particular:
+
+- the learning-curve points (2000 -> 0.36, 2500 -> 0.58, 3066 -> 0.56) are single
+  runs, so **2500 vs 3066 is unambiguously noise** — which was already suspected
+  (§3.8) but is now measured rather than argued;
+- the frozen 0.10 vs 0.16 comparison (§3.6) was a 6-point difference read off
+  single runs against an 8-point spread. Designing a go/no-go decision on it was
+  a planning error, and the fix was always 40 minutes of repeats.
 
 ---
 
