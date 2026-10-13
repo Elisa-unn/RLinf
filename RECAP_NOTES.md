@@ -422,6 +422,13 @@ no comma, so they can be.
   script instantly, and it left **no log at all** — indistinguishable from never
   having been launched. Redirect first, then `set -u`; and use
   `${VAR:-}` for anything that may be unset.
+- **Accepting that a fixed eval set is a population, not a sample, changes two
+  things at once.** It means repeats shrink the error bar (§3.11) — and it also
+  means a pooled Fisher or binomial test on the individual trials no longer
+  applies, because those tests charge you for between-state variance that is not
+  sampling error. Compare the two arms with a two-sample test on the *run-level*
+  means instead. Quoting Fisher here turned a real +5.6-point effect
+  (p = 0.043) into "not distinguishable from zero" (p = 0.245).
 - **A results TSV written by two scripts drifts a column.** The second script
   wrote 5 fields under the first one's 6-field header, so `rc` landed in the
   `return` column and `rc` read empty — which looks like a failed run. Re-derive
@@ -1253,6 +1260,111 @@ is a single n=50 run and carries a comparable error bar. In particular:
 - the frozen 0.10 vs 0.16 comparison (§3.6) was a 6-point difference read off
   single runs against an 8-point spread. Designing a go/no-go decision on it was
   a planning error, and the fix was always 40 minutes of repeats.
+
+---
+
+### 3.12 The behaviour-cloning control: the advantage weighting buys 5.6 points, unfreezing buys 41
+
+The baseline §3.10 said was missing. `cfg_a100b_bc_allpos.yaml`: identical to the
+0.512 run in every respect except that the `advantage` boolean column is all
+`True`, so the conditional branch — the only one inference uses at guidance 1.0 —
+trains on **every** frame regardless of advantage. Behaviour cloning on the same
+data, including all 2097 failed episodes.
+
+| policy | g=1.0 | g=1.5 | n |
+| --- | --- | --- | --- |
+| untrained `pi05_base` | 0.00 | | 50 |
+| frozen VLM, 1 epoch | 0.10 | 0.10 | 50 |
+| frozen VLM, 2 epochs | 0.16 | 0.14 | 50 |
+| **BC on everything, step 2500** | 0.46 | | 50 |
+| **BC on everything, step 3000** | 0.50 | | 50 |
+| **BC on everything, step 3066** | **0.456** | 0.44 | **250** |
+| **RECAP (advantage-weighted)** | **0.512** | 0.36 | **250** |
+| published | 0.665 | | not stated |
+
+BC-all was then repeated five times like RECAP (§3.11), because a single n=50
+run against RECAP's n=250 is the exact asymmetry §3.11 warns about:
+
+```
+RECAP   0.56 0.48 0.56 0.48 0.48   mean 0.5120   sd 0.0438
+BC-all  0.46 0.48 0.46 0.44 0.44   mean 0.4560   sd 0.0167
+```
+
+#### Two tests disagree, and the first version of this section quoted the wrong one
+
+```
+(A) Welch two-sample t on the run-level means          <- the appropriate test
+      diff +0.0560   SE 0.0210   t 2.670   df 5.14
+      two-sided p = 0.0431          95% CI on the diff [+0.002, +0.110]
+
+(B) naive pooled Fisher, 250 trials treated as independent
+      128/250 vs 114/250            p = 0.2447
+```
+
+**(A) is the one to quote.** Each run is an iid draw of a 50-episode average
+over the *same* 50 initial states, and those states are Task 0's whole
+population, so the spread between states is not sampling error. Fisher assumes
+250 independent Bernoulli trials and therefore **overstates** the uncertainty
+here. The direct evidence is BC-all's run-level `sd` of 0.0167 against the
+0.070 a binomial would predict at p=0.456, n=50 — four times tighter.
+
+> **This was an analysis error of mine, not a measurement error**, and it is the
+> second consequence of the same realisation as §3.11: once you accept that the
+> 50 initial states are the population rather than a sample, you get both
+> "repeats shrink the error bar" *and* "Fisher on the pooled trials no longer
+> applies". The first version of this section claimed p = 0.538 and "not
+> distinguishable from zero". Corrected: the effect is real but small.
+
+#### The conclusion is about magnitude, not about zero
+
+```
+unfreezing the VLM     0.10  -> 0.456 / 0.512     about +41 points
+advantage weighting    0.456 -> 0.512             about +5.6 points  (p = 0.043)
+
+unfreezing is 7.4x the advantage-weighting effect
+```
+
+**RECAP's Step 2 (21 h) plus Step 3 (5 h 21 m) buy about 5.6 points. One boolean
+buys 41.** The CI on those 5.6 points has a lower bound of +0.002, i.e. it only
+just clears zero, so it is a real effect measured at the edge of what n=250 on
+this task can resolve.
+
+That is a more useful statement than "the machinery bought nothing": it does not
+deny RECAP, it places its contribution at the right order of magnitude against
+the thing that actually dominated.
+
+#### Training loss, a third time, is uninformative
+
+```
+RECAP   converged 0.0129     success 0.512
+BC-all  converged 0.01341    success 0.46
+```
+
+**4% apart in loss.** This is a cleaner instance than §3.8's (19% loss for 5x
+success), because here the two runs differ in mechanism while their losses are
+effectively identical. A per-frame averaged flow-matching objective cannot see
+the difference between "imitate the good frames" and "imitate every frame".
+
+#### Why the filtered-BC arm was cancelled
+
+`cfg_a100b_bc_succonly.yaml` was built and launched — advantage `True` only for
+the 1999 successful episodes (555,314 of 1,561,874 frames), everything else
+identical — then **killed at step 487 of 3066, discarding ~3.8 GPU-hours**, on
+cost grounds once BC-all came back:
+
+- filtered BC is a *stronger* baseline than BC-all, so it must land ≥ 0.46;
+- RECAP is 0.512;
+- therefore it can only land in roughly [0.46, 0.57], and **no value in that
+  range changes the finding**. It would only sharpen a conclusion already held.
+
+It was the right experiment to queue before BC-all existed, and the wrong one to
+keep afterwards. The 24 hours went unspent; the 30 minutes that the conclusion
+actually rests on (§3.12.1) were spent instead. The config and its parquet are
+kept so the arm can be run later for ~25 h if the sharper number is ever wanted.
+
+> **The generalisable point:** an experiment's value is what it would change,
+> not what it would measure. Re-ask that question every time a result lands,
+> because the answer moves.
 
 ---
 

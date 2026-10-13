@@ -18,6 +18,8 @@ All paths are the rented-machine layout (`/workspace/RLinf`, `/workspace/dataset
 | `find_successful_episodes.py` | How success was established: grouping the rollout split by episode, `return` at the last frame is exactly `-300.0` (2097) or `0.0` (1999), and 1999/4096 = **48.80%** — the number the tutorial reports as its baseline |
 | `chain5.sh` | Phase C replacement: waits for `chain4.sh`, then the filtered-BC run + eval |
 | `dl_rlt.sh`, `rlt_prep.sh` | RLT (ManiSkill) prep: download, artifact verification, norm stats, env smoke test |
+| `chain6.sh` | Final RECAP phase: stop everything, five repeats of the BC-all checkpoint, then remove its own supervisor conf so a container restart costs nothing |
+| `chain7.sh`, `supervise_rlt.sh` | RLT Stage 1: prune, a 2-step probe **that must also save**, then the 2000-step run |
 | `inspect_advantages.py` | Prints row counts, columns and `advantage` true-rate of every advantage parquet |
 | `loss.py` | Windowed means + cumulative differentials of `train/loss`, **alongside `train/learning_rate`** (§3.9) |
 
@@ -41,6 +43,15 @@ All paths are the rented-machine layout (`/workspace/RLinf`, `/workspace/dataset
 - **Verify the artifact, not the exit code.** These read the zip central
   directory of `full_weights.pt`; `$?` after a pipe is the last command's status,
   which once reported success for a dead run.
+- **Probe the phase you will depend on, including saving.** `chain7.sh` runs
+  Stage 1 with `max_steps=2` and `save_interval=1` before the real 2000-step run,
+  then reads the checkpoint's zip central directory. Six earlier memory probes in
+  this project all said "FITS" while running `save_interval: -1`, and saving
+  turned out to be a separate code path with a separate failure.
+- **Two launchers in this repo silently drop extra args.** Neither
+  `run_async.sh` nor `examples/sft/run_vla_sft.sh` has `"$@"` in its `CMD`, so
+  CLI overrides are accepted and ignored. Call the `train_*.py` entry point
+  directly when you need one.
 - **Never edit a shell script that is mid-execution.** Bash reads a script
   lazily from the file and keeps a byte offset, so rewriting it corrupts what the
   running instance reads next. To change a queued phase, use the script's own
