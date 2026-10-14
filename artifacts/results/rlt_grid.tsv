@@ -1,0 +1,3 @@
+gc	mbs	verdict	peak_MiB	ckpt_entries	note
+False	8	OOM	~79150	-	the first probe; 87 MiB free at the failure
+True	8	FITS_AND_SAVES	78451	735	ckpt 62G

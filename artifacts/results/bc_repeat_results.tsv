@@ -1,0 +1,6 @@
+tag	step	guidance	success_once	return	rc
+bcrep1(prior)	3066	1.0	0.46	2.3	0
+bcrep2	3066	1.0	0.48	2.4	0
+bcrep3	3066	1.0	0.46	2.3	0
+bcrep4	3066	1.0	0.44	2.2	0
+bcrep5	3066	1.0	0.44	2.2	0

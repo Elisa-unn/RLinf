@@ -1,0 +1,5 @@
+tag	step	guidance	success_once	return	rc
+bc_s2500	2500	1.0	0.46	2.3	0
+bc_s3000	3000	1.0	0.5	2.5	0
+bc_s3066	3066	1.0	0.46	2.3	0
+bc_s3066_g1.5	3066	1.5	0.44	2.2	0

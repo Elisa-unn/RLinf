@@ -1,0 +1,6 @@
+tag	step	guidance	success_once	return	rc
+rep1(prior)	3066	1.0	0.56	2.8	0
+rep2	3066	1.0	0.48	2.4	0
+rep3	3066	1.0	0.56	2.8	0
+rep4	3066	1.0	0.48	0
+rep5	3066	1.0	0.48	0

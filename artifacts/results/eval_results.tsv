@@ -1,0 +1,5 @@
+checkpoint	guidance	success_once	success_at_end	return	rc
+3066	1.0	0.56	0.56	2.8	0
+3066	1.5	0.36	0.36	1.8	0
+2000	1.0	0.36	0.36	1.8	0
+2500	1.0	0.58	0.56	2.9	0

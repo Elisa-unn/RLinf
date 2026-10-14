@@ -24,3 +24,6 @@ PKG-INFO
 .claude/settings.json
 # Local rescue copies of irreplaceable artifacts (binary, never committed)
 _rescue/
+
+# preserved artifacts are deliberately tracked -- see artifacts/README.md
+!artifacts/**
