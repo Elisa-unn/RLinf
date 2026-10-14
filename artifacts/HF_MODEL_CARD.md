@@ -30,9 +30,15 @@ which are too large to version.
 Each folder holds:
 
 - `full_weights.pt` — **this is what you need to evaluate or re-initialise.**
-  `runner.ckpt_path` points straight at it.
+  `runner.ckpt_path` points straight at it, and RLT Stage 2's
+  `actor.model.model_path` resolves to it as well.
 - `dcp_checkpoint/` — distributed checkpoint with optimizer state, needed only
   to *resume training exactly* (`runner.resume_dir` points at the parent).
+
+`rlt_stage1_step2000/` has only `full_weights.pt`: its 46 GiB of optimizer state
+did not fit under the Hub free tier's private storage limit. That costs nothing
+— the Stage 1 run finished at 2000/2000 so there is nothing to resume, and
+Stage 2 reads `full_weights.pt`.
 
 ## What these three measure
 

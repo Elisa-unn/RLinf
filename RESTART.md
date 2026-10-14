@@ -40,15 +40,44 @@ Model weights are 32-62 GiB each and cannot be versioned, so they went to a
 | `bc_on_everything_0.456/` | the same run with every frame positive | **0.456** (n=250) | 25 |
 | `rlt_stage1_step2000/` | RLT Stage 1, ManiSkill | not evaluated | 13.4 |
 
-Each folder holds both parts, and **the distinction matters**:
+Verified against the local files byte for byte, 78.8 GiB in 11 files:
 
-- `full_weights.pt` — what `runner.ckpt_path` wants. **Enough to evaluate the
-  policy or initialise a new run.** 8.5 GiB for the RECAP arms, 16.4 GiB for RLT.
-- `dcp_checkpoint/` — distributed checkpoint with optimizer state, for
-  `runner.resume_dir`. Needed **only to resume training exactly**, and 3x larger.
+```
+         2,303,958  recap_advantage_weighted_0.512/dcp_checkpoint/.metadata
+    13,048,039,511  recap_advantage_weighted_0.512/dcp_checkpoint/__0_0.distcp
+    12,538,527,191  recap_advantage_weighted_0.512/dcp_checkpoint/__1_0.distcp
+     8,526,557,492  recap_advantage_weighted_0.512/full_weights.pt      -> 34,115,428,152  = local
+         2,303,952  bc_on_everything_0.456/dcp_checkpoint/.metadata
+    13,048,039,511  bc_on_everything_0.456/dcp_checkpoint/__0_0.distcp
+    12,538,527,191  bc_on_everything_0.456/dcp_checkpoint/__1_0.distcp
+     8,526,557,492  bc_on_everything_0.456/full_weights.pt              -> 34,115,428,146  = local
+    16,401,038,312  rlt_stage1_step2000/full_weights.pt                 -> optimizer state absent
+```
 
-So a restart that only wants to evaluate or branch from these policies downloads
-a quarter of the bytes.
+**The distinction between the two parts matters, and it is why the one gap is
+harmless:**
+
+- `full_weights.pt` — what `runner.ckpt_path` wants, and also what RLT Stage 2's
+  `actor.model.model_path` resolves to (`resolve_full_weights` in
+  `openpi_rlinf/utils/rlt_utils.py`; the `get_model` docstring says a model path
+  may be "an RLinf FSDP SFT checkpoint containing `full_weights.pt`"). **Enough
+  to evaluate a policy, initialise a new run, or feed Stage 2.**
+- `dcp_checkpoint/` — optimizer state for `runner.resume_dir`. Needed **only to
+  resume that exact run**, and three times larger.
+
+**RLT Stage 1's optimizer state (46 GiB) is missing**, because the Hub free tier
+stops at ~79 GiB of private storage:
+
+```
+403 Forbidden: Private storage limit reached for user Elisals
+```
+
+That costs nothing here: the Stage 1 run finished at 2000/2000 so there is
+nothing to resume, and Stage 2 reads `full_weights.pt`, which is preserved. If
+it is ever wanted, re-upload it after freeing space or upgrading the plan.
+
+A restart that only wants to evaluate or branch from these policies downloads a
+quarter of the bytes.
 
 ### Still not preserved, and what it costs
 
@@ -194,6 +223,14 @@ Two further things to settle before spending on that:
    `save_interval: -1`; saving is a separate code path with separate failures.
 5. **Never edit a shell script that is mid-execution** — bash reads it lazily by
    byte offset. Use the script's own skip-guard instead.
+6. **`$?` after a pipe is the last command's status.** This is documented in
+   `RECAP_NOTES.md` section 1.14 and was hit again anyway, during the Hub
+   upload: the python uploader was piped through `tr | grep | tail`, so a
+   403 "private storage limit reached" was recorded as success — and the
+   script then printed a derived rate of "39s 1203 MiB/s", which was the speed
+   of failing, not of uploading. **A rate computed from a wall clock is not
+   evidence that anything transferred.** The gap was found only by listing the
+   Hub repo and comparing byte counts against local.
 
 ---
 

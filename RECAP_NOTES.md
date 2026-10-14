@@ -429,6 +429,14 @@ no comma, so they can be.
   sampling error. Compare the two arms with a two-sample test on the *run-level*
   means instead. Quoting Fisher here turned a real +5.6-point effect
   (p = 0.043) into "not distinguishable from zero" (p = 0.245).
+- **A rate computed from a wall clock is not evidence that anything
+  transferred.** During the Hub backup, an uploader piped through
+  `tr | grep | tail` let `$?` report tail's status, so a
+  403 *private storage limit reached* was recorded as success — and the wrapper
+  then printed `39s 1203 MiB/s`, which was the speed of failing. The missing
+  46 GiB was found only by listing the remote repo and comparing byte counts
+  against local. This is the `$?`-after-a-pipe trap in this very list, hit again
+  after being written down.
 - **A results TSV written by two scripts drifts a column.** The second script
   wrote 5 fields under the first one's 6-field header, so `rc` landed in the
   `return` column and `rc` read empty — which looks like a failed run. Re-derive
