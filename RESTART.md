@@ -19,6 +19,7 @@ the order to rebuild.
 | Every config actually used, annotated with its measurements | `examples/offline_rl/config/cfg_a100b_*.yaml`, `examples/sft/config/maniskill_rlt_stage1_a100.yaml`, `evaluations/libero/libero_10_task0_cfg_eval.yaml` |
 | The operational scripts and the bug each one avoids | `tools/recap_ops/` |
 | The one framework behaviour fix | `rlinf/workers/actor/fsdp_sac_policy_worker.py` (`save_with_checkpoint`) |
+| The Hub model card, as published | `artifacts/HF_MODEL_CARD.md` |
 | The partial-unfreeze option | `rlinf/models/embodiment/openpi_cfg/` (`unfreeze_last_n_vlm_layers`) |
 
 **Because the advantage parquet survived, RECAP Steps 1-3 never have to run
@@ -28,22 +29,42 @@ again.** Step 4 reads only the boolean `advantage` column from it.
 
 ## 2. What does not survive, and what it costs
 
-Model weights are 32-62 GiB each and cannot be versioned. Nothing here was
-pushed to the Hub — no token was available on the machine.
+Model weights are 32-62 GiB each and cannot be versioned, so they went to a
+**private Hub repo instead**:
 
-| Lost | Size | Cost to regenerate |
+### `Elisals/rlinf-recap-rlt-checkpoints` (private)
+
+| Folder | Policy | Task 0 @ g=1.0 | GPU-hours |
+| --- | --- | --- | --- |
+| `recap_advantage_weighted_0.512/` | RECAP Step 4, advantage-weighted CFG | **0.512** (n=250) | 25 |
+| `bc_on_everything_0.456/` | the same run with every frame positive | **0.456** (n=250) | 25 |
+| `rlt_stage1_step2000/` | RLT Stage 1, ManiSkill | not evaluated | 13.4 |
+
+Each folder holds both parts, and **the distinction matters**:
+
+- `full_weights.pt` — what `runner.ckpt_path` wants. **Enough to evaluate the
+  policy or initialise a new run.** 8.5 GiB for the RECAP arms, 16.4 GiB for RLT.
+- `dcp_checkpoint/` — distributed checkpoint with optimizer state, for
+  `runner.resume_dir`. Needed **only to resume training exactly**, and 3x larger.
+
+So a restart that only wants to evaluate or branch from these policies downloads
+a quarter of the bytes.
+
+### Still not preserved, and what it costs
+
+| | Size | Cost |
 | --- | --- | --- |
-| RECAP policy, 0.512 (`cfg_a100b_upstream_ep1` step 3066) | 32 GiB | **25 h** on 2x A100-80GB |
-| BC-all policy, 0.456 (`cfg_a100b_bc_allpos` step 3066) | 32 GiB | **25 h** |
-| RLT Stage 1 (`a100b_rlt_stage1` steps 1500, 2000) | 62 GiB each | **13.4 h** |
-| `pi05_base_pytorch` | 6.8 GiB | ~2 h (download + convert), reproducible |
-| RECAP dataset | 82 GiB | download |
-| RLT dataset | 9.2 GiB | download |
-| **Total to get all three policies back** | | **~63 GPU-hours** |
+| `pi05_base_pytorch` | 6.8 GiB | ~2 h (download + convert); the exact verified command is in `RECAP_NOTES.md` section 1.2 |
+| RECAP dataset | 82 GiB | download from `RLinf/RECAP-Libero10-Task0-48succ-Data` |
+| RLT dataset | 9.2 GiB | download from `RLinf/rlt-maniskill-PegInsertionSide-v1-400-succ` |
+| RLT Stage 1 step 1500 | 62 GiB | intermediate only; step 2000 is preserved |
+| frozen-VLM policies (0.10, 0.16) | 19 GiB each | the machine holding them was lost; **superseded anyway** — their only role was as the frozen arm of the A/B |
 
-**If a machine with these is still alive, push the three final checkpoints to a
-private Hub repo before anything else.** 63 GPU-hours is the price of not doing
-it, and three machines were already lost during this project.
+The three policies that carry every result in `RECAP_NOTES.md` are safe. Nothing
+left unpreserved costs more than a download plus ~2 h of conversion.
+
+> Three machines were lost during this project before this backup existed. If a
+> future run produces a checkpoint worth keeping, push it the day it finishes.
 
 ---
 
