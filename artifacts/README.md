@@ -17,6 +17,8 @@ lost and what it costs to rebuild.
 | `all_logs.tar.gz` | 730,946 | all 46 training and eval logs |
 | `tensorboard.tar.gz` | 2,204,540 | 23 event files — the full training curves |
 | `norm_stats.json` | 2,149 | ships with the RLT dataset; kept so the path in the config can be reproduced |
+| `frankasim/sac_cnn_global_step_8189_full_weights.pt` | 61,835,335 | the vision SAC policy, 92-98% — see `frankasim/README.md` |
+| `frankasim/frankasim_raw_logs.tar.gz` | 4,808,117 | ~130 MB of raw logs from the lost 5090 box, including the whole env-parallelism sweep |
 
 **The advantage parquet is the single most valuable file here.** It is 26 GPU-hours
 of value in 30 MB: a 898M-parameter value model trained for 3000 steps, then used

@@ -14,6 +14,7 @@ the order to rebuild.
 | --- | --- |
 | Every finding, number, error bar and correction | `RECAP_NOTES.md` |
 | **Advantage + returns parquets** — 26 GPU-hours in 92 MB | `artifacts/recap/` |
+| **The vision SAC policy** (92-98% on Franka-Sim) and every raw log from the lost 5090 box | `artifacts/frankasim/` |
 | Every evaluation number as raw TSV | `artifacts/results/` |
 | All 46 logs, 23 tensorboard event files | `artifacts/*.tar.gz` |
 | Every config actually used, annotated with its measurements | `examples/offline_rl/config/cfg_a100b_*.yaml`, `examples/sft/config/maniskill_rlt_stage1_a100.yaml`, `evaluations/libero/libero_10_task0_cfg_eval.yaml` |
@@ -88,6 +89,7 @@ quarter of the bytes.
 | RLT dataset | 9.2 GiB | download from `RLinf/rlt-maniskill-PegInsertionSide-v1-400-succ` |
 | RLT Stage 1 step 1500 | 62 GiB | intermediate only; step 2000 is preserved |
 | frozen-VLM policies (0.10, 0.16) | 19 GiB each | the machine holding them was lost; **superseded anyway** — their only role was as the frozen arm of the A/B |
+| PPO MLP policy weights (Franka-Sim, section 2.1) | small | a control run on state observations; its numbers are recorded and it retrains in minutes |
 
 The three policies that carry every result in `RECAP_NOTES.md` are safe. Nothing
 left unpreserved costs more than a download plus ~2 h of conversion.
@@ -141,7 +143,34 @@ Evaluate with `evaluations/libero/libero_10_task0_cfg_eval.yaml`, placement
 **repeat each eval 5 times**: the per-run spread is 8 points and a single n=50
 number is not quotable (section 3.11).
 
-### 3.3 RLT — Stage 1 only
+### 3.3 Franka-Sim — nothing to rebuild
+
+Both recipes in sections 2.1-2.3 are fully preserved: the configs are tracked
+with their measurements in the comments, the SAC policy weights and every raw
+log are in `artifacts/frankasim/`, and the one framework fix
+(`save_with_checkpoint`) is committed.
+
+To re-evaluate the SAC policy rather than retrain it:
+
+```bash
+MUJOCO_GL=egl bash examples/embodiment/run_embodiment.sh frankasim_sac_cnn_eval \
+    runner.ckpt_path=artifacts/frankasim/sac_cnn_global_step_8189_full_weights.pt
+```
+
+Two things that run or ruin this, neither algorithmic:
+
+- **`MUJOCO_GL=egl`.** Unset, rendering silently falls back to CPU software:
+  `env/env_interact_step` goes from 3.4 s to 114.9 s, and the original run
+  scored **0% after 30 hours** with an ETA of ~500 h.
+- **env and rollout on separate GPUs.** Collocated, they deadlock silently for
+  the same CUDA IPC reason as section 3.5.
+
+Also note `algorithm.replay_buffer.save_with_checkpoint`. Left at the old
+unconditional behaviour, every checkpoint carries the whole replay buffer — 24 GB
+against 213 MB of weights — which fills the disk **and** makes every
+`save_interval` timing measurement meaningless.
+
+### 3.4 RLT — Stage 1 only
 
 ```bash
 export HF_LEROBOT_HOME=<root>
@@ -164,7 +193,7 @@ the two fixes this took:
 13.4 h, 2000 steps, ~24 s/step, final loss 0.365. Checkpoints are **62 GiB** —
 janitor with keep=2, and that still needs ~190 GiB free.
 
-### 3.4 RLT Stage 2 — needs at least 3 GPUs, and this is not negotiable
+### 3.5 RLT Stage 2 — needs at least 3 GPUs, and this is not negotiable
 
 Stage 2 runs `actor` + `rollout` + `env`, and **all three pairs exchange
 tensors**: env↔rollout every step (observations and actions), env→actor every
@@ -251,7 +280,7 @@ advantage weighting    +5.6 points   (Welch on run-level means, p = 0.043)
 ```
 
 RLT Stage 1 reproduced (loss 2.235 -> 0.365). Stage 2 not run, for the reason in
-section 3.4.
+section 3.5.
 
 The open question is the remaining 0.512 -> 0.665. Section 3.9 of
 `RECAP_NOTES.md` sets out what it can and cannot be attributed to; the two
